@@ -112,6 +112,10 @@ class ADBlockDOM {
       symbol: e
     }) => this._enterSymbol({
       symbol: e
+    })), this.domConnector.registerTask("enterMessage", ({
+      text: e
+    }) => this._enterMessage({
+      text: e
     })), this.domConnector.registerTask("sendMessage", () => this._sendMessage()), this.domConnector.registerTask("getMessageInput", () => this._getMessageInput()), this.domConnector.registerTask("injectIntoChat", () => this._injectIntoChat()), this.domConnector.registerTask("getLastMessages", () => this._getLastMessages()), this.domConnector.registerTask("getLastMessagesUnsafe", () => this._getLastMessagesUnsafe()), this.domConnector.registerTask("preTaskHooks", () => this._preTaskHooks()), this.domConnector.registerTask("getUserByUsername", ({
       username: e
     }) => this._getUserByUsername(e)), this.domConnector.registerTask("inputSearch", ({
@@ -534,6 +538,42 @@ class ADBlockDOM {
       })
     };
     return attemptInsert(0);
+  }
+  async _enterMessage({
+    text: e
+  }) {
+    const t = await this._importNamespace("Lexical"),
+      n = document.querySelector('div[contenteditable="true"]')?.__lexicalEditor;
+    if (!n) throw new Error("Stuck");
+    var s = r => new Promise((e, s) => {
+      const a = setTimeout(() => {
+        s(new Error("Stuck"))
+      }, 5e3);
+      n.update(() => {
+        try {
+          r(), clearTimeout(a), e()
+        } catch (e) {
+          clearTimeout(a), s(e)
+        }
+      })
+    });
+    await s(() => t.$getRoot().clear());
+    await new Promise((e, t) => {
+      const s = setTimeout(() => {
+        t(new Error("Stuck"))
+      }, 5e3);
+      n.focus(() => {
+        clearTimeout(s), e()
+      })
+    });
+    for (const r of e) {
+      await s(() => {
+        var e = r.charCodeAt(0),
+          e = 13 === e || 10 === e ? t.$createLineBreakNode() : t.$createTextNode(r);
+        t.$insertNodes([e])
+      });
+      await new Promise(e => setTimeout(e, Math.floor(101 * Math.random()) + 50))
+    }
   }
   async _sendMessage() {
     var e = new CustomEvent("keydown", {

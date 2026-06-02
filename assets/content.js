@@ -1315,123 +1315,127 @@ class Instagram {
   }
   async _checkMessageExistsV2({
     username: t,
-    oldMessages: s
+    dateBeforeSend: s,
+    text: a,
+    oldMessages: r,
+    oldThreadInfo: n
   }) {
-    let a = null;
-    for (let e = 0; e < 20; e++) {
-      const n = await this.domConnector.send("getAllMessages", {}),
-        o = n[t];
+    let i = null;
+    r ??= n;
+    var o = !r?.messages?.length ? 150 : 20;
+    for (let e = 0; e < o; e++) {
+      const d = await this.domConnector.send("getAllMessages", {}),
+        l = d[t];
       this.log({
         type: "v2 check debug1",
         data: {
           messages: [{
-            threadInfo: o
+            threadInfo: l
           }, {
-            oldThreadInfo: s
+            oldThreadInfo: r
           }]
         }
       });
-      var r = o?.messages?.filter(t => !s?.messages?.find(e => void 0 !== e?.messageId && e?.messageId === t?.messageId)),
-        i = r?.find(e => e.username !== t);
+      var c,
+        h = l?.messages?.filter(t => !r?.messages?.find(e => void 0 !== e?.messageId && e?.messageId === t?.messageId)),
+        c = h?.find(e => e.username !== t) || l?.messages?.find(e => e.username !== t && Number(e.timestampMs) >= s - 1e3 && (!a || e.text === a));
       if (this.log({
           type: "v2 check debug2",
           data: {
-            messages: [o, s, r, i]
+            messages: [l, r, h, c]
           }
-        }), 19 === e && !i) {
+        }), e === o - 1 && !c) {
         this.log({
           type: "Message was not sent v2",
           data: {
-            status: i.sendStatusV2,
-            username: o.username,
-            messages: o.messages
+            status: c?.sendStatusV2,
+            username: l?.username ?? t,
+            messages: l?.messages ?? []
           }
         });
         break
       }
-      if (a = i?.sendStatusV2, ["4", "5"].includes(i?.sendStatusV2)) {
+      if (i = c?.sendStatusV2, ["4", "5"].includes(c?.sendStatusV2)) {
         this.log({
           type: "Message was not sent v2",
           data: {
-            status: i.sendStatusV2,
-            username: o.username,
-            messages: o.messages
+            status: c?.sendStatusV2,
+            username: l?.username ?? t,
+            messages: l?.messages ?? []
           }
         });
         break
       }
-      if ("2" === i?.sendStatusV2) return this.log({
+      if ("2" === c?.sendStatusV2) return this.log({
         type: "Message was sent v2",
         data: {
-          status: i.sendStatusV2,
-          username: o.username,
-          messages: o.messages
+          status: c?.sendStatusV2,
+          username: l?.username ?? t,
+          messages: l?.messages ?? []
         }
-      }), a;
+      }), i;
       await this.sleep(200)
     }
-    const n = await this.domConnector.send("getAllMessages", {}),
-      o = n[t];
+    const d = await this.domConnector.send("getAllMessages", {}),
+      l = d[t];
     return this.log({
       type: "Check message exists v2 returning false - unexpected",
       data: {
-        messages: [o]
+        messages: [l]
       }
-    }), a
+    }), i
   }
   async _sendMessage({
-    text: s,
+    text: t,
     username: e
   }) {
-    var t = await this.domConnector.send("getLastMessagesUnsafe", {}),
-      t = (this.log({
+    var s = await this.domConnector.send("getLastMessagesUnsafe", {}),
+      s = (this.log({
         type: "Received last messages",
         data: {
-          messages: t
+          messages: s
         }
-      }), t.length ? t[t.length - 1].messageId : null),
+      }), s.length ? s[s.length - 1].messageId : null),
       a = (this.log({
         type: "Saving last message ID",
         data: {
-          messageId: t || void 0
+          messageId: s || void 0
         }
       }), await this.domConnector.send("getAllMessages", {})),
-      a = a[e];
-    for (let t = 0; t < s.length; ++t)
-      for (let e = 0; e < 5; e++) {
-        try {
-          await this.domConnector.send("enterSymbol", {
-            symbol: s.charAt(t)
-          });
-        } catch (err) {
-          const errStr = typeof err === 'string' ? err : (err?.error || err?.message || '');
-          if (errStr.includes("Stuck")) {
-            this.log({ type: "enterSymbol stuck, retrying", data: { symbol: s.charAt(t) } });
-          } else {
-            throw err;
+      a = a[e],
+      r = t.replace(/\r\n?/g, "\n");
+    for (let e = 0; e < 5; e++) {
+      await this.domConnector.send("enterMessage", {
+        text: t
+      });
+      await this.sleep(Helpers.rand(50, 150));
+      const i = await this.domConnector.send("getMessageInput", {});
+      if (i === r) break;
+      if (this.log({
+          type: "Message input verification failed, retrying",
+          data: {
+            attempt: e,
+            expectedLength: r.length,
+            actualLength: i?.length ?? null
           }
-        }
-        await new Promise(r => setTimeout(r, Helpers.rand(50, 150)));
-        const r = await this.domConnector.send("getMessageInput", {});
-        if (r === s.substring(0, t + 1)) break;
-        if (4 === e) throw new Error("Failed to input")
-      }
-    const r = await this.domConnector.send("getMessageInput", {});
+        }), 4 === e) throw new Error("Failed to input")
+    }
+    const i = await this.domConnector.send("getMessageInput", {});
     this.log({
       type: "Current input",
       data: {
-        message: r
+        message: i
       }
     });
-    var i = Date.now(),
+    var n = Date.now(),
       e = (await this.domConnector.send("sendMessage", {}), await this.sleep(5e3), await this._checkMessageExistsV2({
         username: e,
-        dateBeforeSend: i,
-        text: s,
+        dateBeforeSend: n,
+        text: t,
         oldThreadInfo: a
       }));
     if ("2" === e) return !0;
-    await this._checkMessageExists(t);
+    await this._checkMessageExists(s);
     throw new ExtensionError({
       type: "check_message_error",
       message: "Message not found",
