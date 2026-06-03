@@ -9,7 +9,8 @@ let state = {
   stats: { completed: 0, failed: 0 },
   isProcessing: false,
   processingLockAcquiredAt: 0,
-  instagramTabId: null
+  mainTabId: null,
+  additionalTabId: null
 };
 
 async function persistDebugLog(msg) {
@@ -117,13 +118,14 @@ async function refreshAccessToken() {
 // ---------------------------------------------------------------------------
 
 async function init() {
-  const data = await chrome.storage.local.get(['accessToken', 'refreshToken', 'browserId', 'browserLabel', 'stats', 'instagramTabId']);
+  const data = await chrome.storage.local.get(['accessToken', 'refreshToken', 'browserId', 'browserLabel', 'stats', 'mainTabId', 'additionalTabId']);
   if (data.accessToken) state.accessToken = data.accessToken;
   if (data.refreshToken) state.refreshToken = data.refreshToken;
   if (data.browserId) state.browserId = data.browserId;
   if (data.browserLabel) state.browserLabel = data.browserLabel;
   if (data.stats) state.stats = data.stats;
-  if (data.instagramTabId) state.instagramTabId = data.instagramTabId;
+  if (data.mainTabId) state.mainTabId = data.mainTabId;
+  if (data.additionalTabId) state.additionalTabId = data.additionalTabId;
 
   if (state.refreshToken && state.browserId) {
     await refreshAccessToken();
@@ -439,7 +441,7 @@ async function executeTask(task) {
       usePreresolvedNames: usePreresolved
     };
     
-    const res = await sendTaskToContent("sendMessage", payload);
+    const res = await sendTaskToContent("main", "sendMessage", payload);
     if (!res?.success) throw new Error(res?.error?.error || "Send message failed");
     return true;
   } 
@@ -515,7 +517,7 @@ async function executeTask(task) {
       chrome.runtime.onMessage.addListener(handler);
 
       const params = JSON.parse(task.message_text);
-      const res = await sendTaskToContent("parsing", {
+      const res = await sendTaskToContent("additional", "parsing", {
         taskId: task.id,
         username: params.target,
         type: task.task_type === 'scrape_followers' ? "followers" : "following",
@@ -546,23 +548,23 @@ function randUrl() {
   return urls[Math.floor(Math.random() * urls.length)];
 }
 
-async function openMainTab() {
-  // Check if existing tab is still alive
-  if (state.instagramTabId) {
+async function openTab(type) {
+  const stateKey = type === 'main' ? 'mainTabId' : 'additionalTabId';
+  
+  if (state[stateKey]) {
     try {
-      const tab = await chrome.tabs.get(state.instagramTabId);
+      const tab = await chrome.tabs.get(state[stateKey]);
       if (tab && !tab.discarded) {
-        debugLog(`Reusing existing tab ${state.instagramTabId}`);
-        return state.instagramTabId;
+        debugLog(`Reusing existing ${type} tab ${state[stateKey]}`);
+        return state[stateKey];
       }
     } catch (e) {
-      state.instagramTabId = null;
+      state[stateKey] = null;
     }
   }
 
-  debugLog("Opening pinned Instagram tab...");
+  debugLog(`Opening pinned Instagram ${type} tab...`);
 
-  // Create a pinned background tab exactly like production does
   const tab = await chrome.tabs.create({
     url: randUrl(),
     active: false,
@@ -570,12 +572,11 @@ async function openMainTab() {
     pinned: true
   });
 
-  state.instagramTabId = tab.id;
-  await chrome.storage.local.set({ instagramTabId: tab.id });
+  state[stateKey] = tab.id;
+  await chrome.storage.local.set({ [stateKey]: tab.id });
 
-  debugLog(`Tab opened: ${tab.id}, waiting for load...`);
+  debugLog(`Tab opened (${type}): ${tab.id}, waiting for load...`);
 
-  // Wait for tab to fully load (up to 10 seconds)
   for (let i = 0; i < 25; i++) {
     try {
       const t = await chrome.tabs.get(tab.id);
@@ -584,17 +585,22 @@ async function openMainTab() {
     await sleep(400);
   }
 
-  debugLog("Tab ready.");
-
+  debugLog(`Tab ready (${type}).`);
   return tab.id;
 }
 
-async function closeMainTab() {
-  if (state.instagramTabId) {
-    try { await chrome.tabs.remove(state.instagramTabId); } catch(e) {}
-    state.instagramTabId = null;
-    await chrome.storage.local.remove('instagramTabId');
-    debugLog("Tab closed.");
+async function closeTabs() {
+  if (state.mainTabId) {
+    try { await chrome.tabs.remove(state.mainTabId); } catch(e) {}
+    state.mainTabId = null;
+    await chrome.storage.local.remove('mainTabId');
+    debugLog("Main Tab closed.");
+  }
+  if (state.additionalTabId) {
+    try { await chrome.tabs.remove(state.additionalTabId); } catch(e) {}
+    state.additionalTabId = null;
+    await chrome.storage.local.remove('additionalTabId');
+    debugLog("Additional Tab closed.");
   }
 }
 
@@ -602,8 +608,8 @@ function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
 
-async function sendTaskToContent(taskType, taskData) {
-  const tabId = await openMainTab();
+async function sendTaskToContent(tabType, taskType, taskData) {
+  const tabId = await openTab(tabType);
 
   debugLog(`Sending '${taskType}' to tab ${tabId}`);
 
@@ -657,7 +663,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
   if (message.type === "HUB_DISCONNECT") {
     stopEngine();
-    closeMainTab();
+    closeTabs();
     state.browserId = null;
     state.browserLabel = null;
     state.stats = { completed: 0, failed: 0 };
@@ -677,13 +683,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
   if (message.type === "HUB_PAUSE_ENGINE") {
     debugLog("[Engine] Paused by user.");
-    closeMainTab();
+    closeTabs();
     sendResponse({ ok: true });
     return;
   }
   if (message.type === "HUB_RESUME_ENGINE") {
     debugLog("[Engine] Resumed by user. Opening tab eagerly.");
-    openMainTab(); // Eagerly load tab so it's ready for polling
+    openTab('main'); // Eagerly load tab so it's ready for polling
     sendResponse({ ok: true });
     return;
   }
@@ -710,9 +716,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (taskType === "getTabType") {
       const tabId = sender.tab?.id;
       (async () => {
-        const storedTabId = state.instagramTabId;
         let result = null;
-        if (tabId && storedTabId && tabId === storedTabId) result = "main";
+        if (tabId && state.mainTabId && tabId === state.mainTabId) result = "main";
+        if (tabId && state.additionalTabId && tabId === state.additionalTabId) result = "additional";
         sendResponse({ success: true, result });
       })();
       return true; // async response
@@ -756,9 +762,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 });
 
 chrome.tabs.onRemoved.addListener(tabId => {
-  if (state.instagramTabId === tabId) {
-    state.instagramTabId = null;
-  }
+  if (state.mainTabId === tabId) state.mainTabId = null;
+  if (state.additionalTabId === tabId) state.additionalTabId = null;
 });
 
 // Boot
