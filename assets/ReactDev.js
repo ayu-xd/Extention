@@ -87,6 +87,7 @@
       return -1 < this._tree.getDisplayNameForFiber(e)?.indexOf(t) && r.push(new z(e, this._tree)), e.child && r.push(...this._recursiveSearch(e.child, t)), e.sibling && r.push(...this._recursiveSearch(e.sibling, t)), r
     }
     _recursiveSearchV2(t, r) {
+      if (!t) return [];
       var s = [];
       if (-1 < this._tree.getDisplayNameForFiber(t)?.indexOf(r) && s.push(new z(t, this._tree)), t.child) {
         let e = t.child;
