@@ -268,15 +268,20 @@ class ADBlockDOM {
     return document.querySelector('div[contenteditable="true"]').__lexicalTextContent
   }
   trickState() {
-    Object.defineProperty(document, "hasFocus", {
-      get() {
-        return () => !0
-      }
-    }), Object.defineProperty(document, "hidden", {
-      get() {
-        return !1
-      }
-    });
+    try {
+      Object.defineProperty(document, "hasFocus", {
+        get() {
+          return () => !0
+        },
+        configurable: true
+      });
+      Object.defineProperty(document, "hidden", {
+        get() {
+          return !1
+        },
+        configurable: true
+      });
+    } catch (err) {}
     {
       var t = document,
         s = "visibilitychange";

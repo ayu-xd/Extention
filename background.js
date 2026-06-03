@@ -666,8 +666,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
   if (message.type === "GET_STATS") {
     (async () => {
-      const stats = await syncStatsFromDatabase();
-      sendResponse({ ok: true, stats });
+      try {
+        const stats = await syncStatsFromDatabase();
+        sendResponse({ ok: true, stats });
+      } catch (err) {
+        sendResponse({ ok: false, error: err.message });
+      }
     })();
     return true;
   }

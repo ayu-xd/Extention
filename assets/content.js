@@ -155,6 +155,10 @@ class BackgroundConnector extends AsyncEventEmitter {
         }
       })
     } catch (a) {
+      if (a.message && a.message.includes("Extension context invalidated")) {
+        console.warn("Context invalidated. Please refresh the page.");
+        return;
+      }
       throw console.error("Error while sending to background", a), a
     }
     if (s.success) return s.result;
@@ -162,14 +166,19 @@ class BackgroundConnector extends AsyncEventEmitter {
     throw a.stack = s.error.stack, a
   }
   async emit(e, t = {}) {
-    await chrome.runtime.sendMessage({
-      type: BACKGROUND_OUTER_KEY,
-      isEmit: !0,
-      data: {
-        type: e,
-        data: t
-      }
-    })
+    try {
+      await chrome.runtime.sendMessage({
+        type: BACKGROUND_OUTER_KEY,
+        isEmit: !0,
+        data: {
+          type: e,
+          data: t
+        }
+      })
+    } catch (a) {
+      if (a.message && a.message.includes("Extension context invalidated")) return;
+      throw a;
+    }
   }
   registerTask(e, t) {
     this.tasks[e] = t

@@ -594,9 +594,9 @@
             o = n.child, o = o ? o.sibling : null, o = o ? o.child : null;
             null !== o && this.mountFiberRecursively(o, n, !0, s)
           } else {
-            let e = null; - 1 === this.ReactTypeOfWork.OffscreenComponent ? e = n.child : null !== n.child && (e = n.child.child), null !== e && this.mountFiberRecursively(e, n, !0, s)
+            let e = null; - 1 === this.ReactTypeOfWork.OffscreenComponent ? e = n.child : n.child != null && (e = n.child.child), null !== e && this.mountFiberRecursively(e, n, !0, s)
           }
-        else null !== n.child && this.mountFiberRecursively(n.child, n, !0, s);
+        else n.child != null && this.mountFiberRecursively(n.child, n, !0, s);
         n = r ? n.sibling : null
       }
     }

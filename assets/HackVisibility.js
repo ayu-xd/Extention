@@ -3,11 +3,16 @@
     setTimeout(() => e?.(), 0)
   }, window.requestIdleCallback = e => {
     e?.()
-  }, Object.defineProperty(document, "hasFocus", {
-    get() {
-      return () => !0
-    }
-  }), Document.prototype.hasFocus = new Proxy(Document.prototype.hasFocus, {
+  };
+  try {
+    Object.defineProperty(document, "hasFocus", {
+      get() {
+        return () => !0
+      },
+      configurable: true
+    });
+  } catch (err) {}
+  Document.prototype.hasFocus = new Proxy(Document.prototype.hasFocus, {
     apply(e, t, n) {
       return Reflect.apply(e, t, n)
     }
