@@ -730,27 +730,46 @@ class Instagram {
               });
               await this.sleep(5e3);
               
-              if (_hasImage && _imageArrayBuffer && _imageType) {
-                 this.log({ type: "Injecting Local Image via DOM", data: {} });
-                 await this.domConnector.send("sendImage", { buffer: _imageArrayBuffer, type: _imageType });
-                 await this.sleep(3000); // Wait for Instagram's React to process the file and upload preview
-              }
+              var _tokens = f.split(/(\[BUBBLE\]|\[IMAGE\])/);
+              let imageInjected = false;
+              let hasSentAction = false;
 
-              var _chunks = f.split("[BUBBLE]");
-              for (let i = 0; i < _chunks.length; i++) {
-                var _c = _chunks[i].trim();
-                if (_c) {
+              for (let i = 0; i < _tokens.length; i++) {
+                var _token = _tokens[i].trim();
+                if (!_token || _token === "[BUBBLE]") continue;
+
+                if (hasSentAction) {
+                  await this.sleep(2000);
+                }
+
+                if (_token === "[IMAGE]") {
+                  if (_hasImage && _imageArrayBuffer && _imageType) {
+                    this.log({ type: "Injecting Local Image via DOM", data: {} });
+                    await this.domConnector.send("sendImage", { buffer: _imageArrayBuffer, type: _imageType });
+                    await this.sleep(3000); // Instagram needs time to upload the preview
+                    imageInjected = true;
+                    hasSentAction = true;
+                  }
+                } else {
                   try {
                     await this._sendMessage({
-                      text: _c,
+                      text: _token,
                       username: e.username
                     });
                   } catch (chunkErr) {
                     this.log({ type: "Chunk verification failed (ignoring)", data: { error: chunkErr?.toString() } });
                   }
-                  if (i < _chunks.length - 1) await this.sleep(2000);
+                  hasSentAction = true;
                 }
               }
+
+              if (_hasImage && _imageArrayBuffer && _imageType && !imageInjected) {
+                 if (hasSentAction) await this.sleep(2000);
+                 this.log({ type: "Injecting Local Image via DOM (Fallback at End)", data: {} });
+                 await this.domConnector.send("sendImage", { buffer: _imageArrayBuffer, type: _imageType });
+                 await this.sleep(3000);
+              }
+
               var w = window.location.href.match(/direct\/t\/(\d+)/)?.[1];
               return this.backgroundConnector.emit("successTask", {
                 result: !0,
