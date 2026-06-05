@@ -34,6 +34,11 @@ document.addEventListener('DOMContentLoaded', async () => {
   const maxVarianceIn = document.getElementById('maxVariance');
   const preresolvedToggle = document.getElementById('usePreresolvedToggle');
 
+  const imageUploadInput = document.getElementById('imageUploadInput');
+  const selectImagesBtn = document.getElementById('selectImagesBtn');
+  const clearImagesBtn = document.getElementById('clearImagesBtn');
+  const imageCountDisplay = document.getElementById('imageCountDisplay');
+
   const debugDiv = document.getElementById('debugLogs');
   const downloadLogsBtn = document.getElementById('downloadLogsBtn');
   const clearLogsBtn = document.getElementById('clearLogsBtn');
@@ -202,6 +207,52 @@ document.addEventListener('DOMContentLoaded', async () => {
       await chrome.storage.local.set({ usePreresolvedNames: preresolvedToggle.checked });
     });
   }
+
+  // Initial load of image count
+  if (globalThis.ImageStorage && imageCountDisplay) {
+    globalThis.ImageStorage.getAllImagesCount().then(count => {
+      imageCountDisplay.textContent = count;
+    }).catch(e => console.error("Error loading image count", e));
+  }
+
+  selectImagesBtn?.addEventListener('click', () => {
+    imageUploadInput.click();
+  });
+
+  imageUploadInput?.addEventListener('change', async (e) => {
+    const files = e.target.files;
+    if (!files || files.length === 0) return;
+    selectImagesBtn.textContent = 'Saving...';
+    selectImagesBtn.disabled = true;
+    
+    try {
+      for (let i = 0; i < files.length; i++) {
+        const file = files[i];
+        const username = file.name.replace(/\.[^/.]+$/, "");
+        await globalThis.ImageStorage.saveImage(username, file);
+      }
+      const newCount = await globalThis.ImageStorage.getAllImagesCount();
+      if (imageCountDisplay) imageCountDisplay.textContent = newCount;
+    } catch (err) {
+      console.error("Upload error", err);
+    } finally {
+      selectImagesBtn.textContent = 'Select Images';
+      selectImagesBtn.disabled = false;
+      imageUploadInput.value = '';
+    }
+  });
+
+  clearImagesBtn?.addEventListener('click', async () => {
+    if (confirm("Are you sure you want to clear all loaded images?")) {
+      try {
+        await globalThis.ImageStorage.clearAll();
+        const newCount = await globalThis.ImageStorage.getAllImagesCount();
+        if (imageCountDisplay) imageCountDisplay.textContent = newCount;
+      } catch (err) {
+        console.error("Clear error", err);
+      }
+    }
+  });
 
   chrome.runtime.onMessage.addListener((msg) => {
     if (msg.type === 'HUB_LOGIN_SUCCESS') {

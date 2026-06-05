@@ -1,6 +1,8 @@
 const SUPABASE_URL = "https://pkzkoixryggxktaybwkp.supabase.co";
 const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBremtvaXhyeWdneGt0YXlid2twIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzY2MDQ2MDQsImV4cCI6MjA5MjE4MDYwNH0.G21RTb9scU7biERl1HqKQYOCUYV4pKStKF9Ls4lo8rY";
 
+importScripts("assets/imageStorage.js");
+
 let state = {
   accessToken: null,
   refreshToken: null,
@@ -439,11 +441,34 @@ async function executeTask(task) {
     const nameSettings = await chrome.storage.local.get('usePreresolvedNames');
     const usePreresolved = nameSettings.usePreresolvedNames !== false; // default ON
 
+    let hasImage = false;
+    let imageUsername = null;
+    let imageArrayBuffer = null;
+    let imageType = null;
+    
+    if (typeof globalThis !== "undefined" && globalThis.ImageStorage) {
+      const img = await globalThis.ImageStorage.getImage(targetUsername);
+      if (img) {
+        hasImage = true;
+        imageUsername = targetUsername;
+        imageType = img.type;
+        // Convert Blob to ArrayBuffer for passing through the Chrome Messaging bridge
+        const arrayBuf = await img.arrayBuffer();
+        // Convert ArrayBuffer to Array for JSON serialization just in case structured cloning fails over MV3 boundaries
+        imageArrayBuffer = Array.from(new Uint8Array(arrayBuf));
+        debugLog(`[Image Manager] Found local image for ${targetUsername}`);
+      }
+    }
+
     const payload = {
       target: { username: targetUsername },
       message: { text: task.message_text },
       taskId: task.id,
-      usePreresolvedNames: usePreresolved
+      usePreresolvedNames: usePreresolved,
+      hasImage,
+      imageUsername,
+      imageType,
+      imageArrayBuffer
     };
     
     const res = await sendTaskToContent("main", "sendMessage", payload);

@@ -729,6 +729,13 @@ class Instagram {
                 data: { message: f }
               });
               await this.sleep(5e3);
+              
+              if (_hasImage && _imageArrayBuffer && _imageType) {
+                 this.log({ type: "Injecting Local Image via DOM", data: {} });
+                 await this.domConnector.send("sendImage", { buffer: _imageArrayBuffer, type: _imageType });
+                 await this.sleep(3000); // Wait for Instagram's React to process the file and upload preview
+              }
+
               var _chunks = f.split("[BUBBLE]");
               for (let i = 0; i < _chunks.length; i++) {
                 var _c = _chunks[i].trim();

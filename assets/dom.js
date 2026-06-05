@@ -116,7 +116,7 @@ class ADBlockDOM {
       text: e
     }) => this._enterMessage({
       text: e
-    })), this.domConnector.registerTask("sendMessage", () => this._sendMessage()), this.domConnector.registerTask("getMessageInput", () => this._getMessageInput()), this.domConnector.registerTask("injectIntoChat", () => this._injectIntoChat()), this.domConnector.registerTask("getLastMessages", () => this._getLastMessages()), this.domConnector.registerTask("getLastMessagesUnsafe", () => this._getLastMessagesUnsafe()), this.domConnector.registerTask("preTaskHooks", () => this._preTaskHooks()), this.domConnector.registerTask("getUserByUsername", ({
+    })), this.domConnector.registerTask("sendMessage", () => this._sendMessage()), this.domConnector.registerTask("sendImage", (data) => this._sendImage(data)), this.domConnector.registerTask("getMessageInput", () => this._getMessageInput()), this.domConnector.registerTask("injectIntoChat", () => this._injectIntoChat()), this.domConnector.registerTask("getLastMessages", () => this._getLastMessages()), this.domConnector.registerTask("getLastMessagesUnsafe", () => this._getLastMessagesUnsafe()), this.domConnector.registerTask("preTaskHooks", () => this._preTaskHooks()), this.domConnector.registerTask("getUserByUsername", ({
       username: e
     }) => this._getUserByUsername(e)), this.domConnector.registerTask("inputSearch", ({
       username: e
@@ -589,6 +589,25 @@ class ADBlockDOM {
       t = document.querySelector('div[contenteditable="true"]'),
       s = await this._importNamespace("Lexical");
     t.__lexicalEditor.dispatchCommand(s.KEY_ENTER_COMMAND, e)
+  }
+  async _sendImage({ buffer, type }) {
+    if (!buffer || !type) return;
+    try {
+      const uint8Array = new Uint8Array(buffer);
+      const blob = new Blob([uint8Array], { type });
+      const filename = "image" + (type.includes("png") ? ".png" : ".jpg");
+      const file = new File([blob], filename, { type });
+      
+      const fileInput = document.querySelector('input[type="file"][accept*="image"]');
+      if (fileInput) {
+        const dataTransfer = new DataTransfer();
+        dataTransfer.items.add(file);
+        fileInput.files = dataTransfer.files;
+        fileInput.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+    } catch(err) {
+      console.error("DOM Image injection failed:", err);
+    }
   }
   async _getText(e, t) {
     e = await this._importNamespace(e);
