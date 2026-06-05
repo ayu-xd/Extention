@@ -724,15 +724,27 @@ class Instagram {
                   this.log({ type: "getUserFromContacts returned undefined, using raw message", data: {} });
                 }
               }
-              var w = (this.log({
-                  type: "Prepared message",
-                  data: {
-                    message: f
+              this.log({
+                type: "Prepared message",
+                data: { message: f }
+              });
+              await this.sleep(5e3);
+              var _chunks = f.split("[BUBBLE]");
+              for (let i = 0; i < _chunks.length; i++) {
+                var _c = _chunks[i].trim();
+                if (_c) {
+                  try {
+                    await this._sendMessage({
+                      text: _c,
+                      username: e.username
+                    });
+                  } catch (chunkErr) {
+                    this.log({ type: "Chunk verification failed (ignoring)", data: { error: chunkErr?.toString() } });
                   }
-                }), await this.sleep(5e3), await this._sendMessage({
-                  text: f,
-                  username: e.username
-                }), window.location.href.match(/direct\/t\/(\d+)/)?.[1]);
+                  if (i < _chunks.length - 1) await this.sleep(2000);
+                }
+              }
+              var w = window.location.href.match(/direct\/t\/(\d+)/)?.[1];
               return this.backgroundConnector.emit("successTask", {
                 result: !0,
                 taskId: s,

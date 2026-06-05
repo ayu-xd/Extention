@@ -305,6 +305,11 @@ function randomInt(min, max) {
 
 async function pollTasks() {
   if (!state.browserId) return;
+  const pacingData = await chrome.storage.local.get('wakeUpAt');
+  if (pacingData.wakeUpAt && Date.now() < pacingData.wakeUpAt) {
+    return; // Still sleeping for human pacing
+  }
+
   if (state.isProcessing) {
     // Safety auto-unlock if stuck for more than 10 minutes (600,000 ms)
     if (Date.now() - state.processingLockAcquiredAt > 600000) {
@@ -411,10 +416,10 @@ async function pollTasks() {
     
     debugLog(`[Pacing] Sleeping for ${Math.round(delayMs/1000)}s to mimic human break...`);
 
-    setTimeout(() => {
-      state.isProcessing = false;
-      debugLog(`[Pacing] Waking up, ready for next task.`);
-    }, delayMs);
+    const wakeUpAt = Date.now() + delayMs;
+    await chrome.storage.local.set({ wakeUpAt });
+    
+    state.isProcessing = false;
 
   } catch (err) {
     console.error("Polling error:", err);
