@@ -336,37 +336,20 @@ async function pollTasks() {
       return;
     }
 
-    const url = `dm_tasks?select=*&browser_instance_id=eq.${state.browserId}&status=eq.pending&order=created_at.asc&limit=1`;
-    // 1. Fetch pending task
+    // 1. Fetch a pending task — join campaigns!inner so we ONLY get tasks whose
+    //    parent campaign is currently active. Paused/draft/deleted campaign tasks
+    //    are invisible to the engine at the DB level, preventing any race condition.
+    const url = `dm_tasks?select=*,campaigns!inner(status)&browser_instance_id=eq.${state.browserId}&status=eq.pending&campaigns.status=eq.active&order=created_at.asc&limit=1`;
     const tasks = await supabaseReq(url);
 
     if (!tasks || tasks.length === 0) {
-      // Diagnostic check: what CAN we see?
-      const allTasks = await supabaseReq(`dm_tasks?select=id,status,browser_instance_id,task_type`);
-      debugLog(`[Poll] 0 pending tasks found for ${state.browserId}. Diagnostic: visible tasks total = ${allTasks ? allTasks.length : 0}`);
-      
-      if (allTasks && allTasks.length > 0) {
-         debugLog(`[Poll] First visible task: status=${allTasks[0].status}, browserId=${allTasks[0].browser_instance_id}`);
-      }
+      debugLog(`[Poll] 0 pending tasks found for browser ${state.browserId} (only active campaign tasks are checked).`);
       return; // Not processing, will retry on next alarm naturally
     }
     
     const task = tasks[0];
-
-    // PACING/PAUSE SYNC FIX: Validate parent campaign is still active
-    if (task.campaign_id) {
-      try {
-        const campData = await supabaseReq(`campaigns?select=status&id=eq.${task.campaign_id}`);
-        if (campData && campData.length > 0 && campData[0].status !== 'active') {
-          debugLog(`[Poll] Task ${task.id} belongs to inactive campaign (status=${campData[0].status}). Cancelling task...`);
-          // Clean up the orphaned pending task
-          await supabaseReq(`dm_tasks?id=eq.${task.id}`, "PATCH", { status: "cancelled" });
-          return; // Skip processing this task
-        }
-      } catch (err) {
-        console.warn("Failed to check campaign status:", err);
-      }
-    }
+    // Strip out the joined campaigns object so downstream code doesn't see it
+    delete task.campaigns;
 
     state.isProcessing = true;
     state.processingLockAcquiredAt = Date.now();
