@@ -228,7 +228,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     try {
       for (let i = 0; i < files.length; i++) {
         const file = files[i];
-        const username = file.name.replace(/\.[^/.]+$/, "");
+        // Only strip known image extensions so usernames with dots (like 'user.name') aren't truncated if they lack an extension
+        const username = file.name.replace(/\.(png|jpe?g|webp|gif|heic|bmp)$/i, "");
         await globalThis.ImageStorage.saveImage(username, file);
       }
       const newCount = await globalThis.ImageStorage.getAllImagesCount();
