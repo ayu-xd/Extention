@@ -352,6 +352,22 @@ async function pollTasks() {
     }
     
     const task = tasks[0];
+
+    // PACING/PAUSE SYNC FIX: Validate parent campaign is still active
+    if (task.campaign_id) {
+      try {
+        const campData = await supabaseReq(`campaigns?select=status&id=eq.${task.campaign_id}`);
+        if (campData && campData.length > 0 && campData[0].status !== 'active') {
+          debugLog(`[Poll] Task ${task.id} belongs to inactive campaign (status=${campData[0].status}). Cancelling task...`);
+          // Clean up the orphaned pending task
+          await supabaseReq(`dm_tasks?id=eq.${task.id}`, "PATCH", { status: "cancelled" });
+          return; // Skip processing this task
+        }
+      } catch (err) {
+        console.warn("Failed to check campaign status:", err);
+      }
+    }
+
     state.isProcessing = true;
     state.processingLockAcquiredAt = Date.now();
     
