@@ -40,12 +40,45 @@ class ImageStorage {
 
   async getImage(username) {
     const db = await this.init();
+    const normalizedUsername = username.toLowerCase().trim();
+    
+    // First try exact match
+    const exactResult = await new Promise((resolve, reject) => {
+      const transaction = db.transaction(STORE_NAME, "readonly");
+      const store = transaction.objectStore(STORE_NAME);
+      const request = store.get(normalizedUsername);
+      request.onsuccess = () => resolve(request.result ? request.result.blob : null);
+      request.onerror = () => reject(request.error);
+    });
+    
+    if (exactResult) return exactResult;
+    
+    // Fallback: scan all keys for a fuzzy match (handles extension mismatches like "user.sol" vs "user")
     return new Promise((resolve, reject) => {
       const transaction = db.transaction(STORE_NAME, "readonly");
       const store = transaction.objectStore(STORE_NAME);
-      const normalizedUsername = username.toLowerCase().trim();
-      const request = store.get(normalizedUsername);
-      request.onsuccess = () => resolve(request.result ? request.result.blob : null);
+      const request = store.openCursor();
+      let found = null;
+      console.log(`[ImageStorage] Fallback scan started for: "${normalizedUsername}"`);
+      request.onsuccess = (event) => {
+        const cursor = event.target.result;
+        if (cursor) {
+          const key = cursor.value.username;
+          console.log(`[ImageStorage] Comparing with DB key: "${key}"`);
+          // Match if stored key starts with our username (e.g. "memeflipper.sol" starts with "memeflipper")
+          // or if our username starts with stored key (e.g. looking up "memeflipper.sol" matches stored "memeflipper")
+          if (key.startsWith(normalizedUsername) || normalizedUsername.startsWith(key)) {
+            console.log(`[ImageStorage] Fuzzy match SUCCESS: "${key}" matches "${normalizedUsername}"`);
+            found = cursor.value.blob;
+            resolve(found);
+            return;
+          }
+          cursor.continue();
+        } else {
+          console.log(`[ImageStorage] Fallback scan completed. No match found for: "${normalizedUsername}"`);
+          resolve(null);
+        }
+      };
       request.onerror = () => reject(request.error);
     });
   }

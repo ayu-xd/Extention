@@ -591,22 +591,83 @@ class ADBlockDOM {
     t.__lexicalEditor.dispatchCommand(s.KEY_ENTER_COMMAND, e)
   }
   async _sendImage({ buffer, type }) {
-    if (!buffer || !type) return;
+    console.log("[DmDroid DOM] _sendImage called", { bufferLen: buffer?.length, type });
+    if (!buffer || !type) {
+      console.error("[DmDroid DOM] _sendImage: missing buffer or type!");
+      return;
+    }
     try {
       const uint8Array = new Uint8Array(buffer);
       const blob = new Blob([uint8Array], { type });
       const filename = "image" + (type.includes("png") ? ".png" : ".jpg");
-      const file = new File([blob], filename, { type });
+      const file = new File([blob], filename, { type, lastModified: Date.now() });
+      console.log("[DmDroid DOM] File created:", { name: filename, size: blob.size, type });
       
-      const fileInput = document.querySelector('input[type="file"][accept*="image"]');
+      // Strategy 1: Try to find existing file input
+      let fileInput = document.querySelector('input[type="file"]');
+      
+      if (!fileInput) {
+        console.log("[DmDroid DOM] No file input found, clicking image button to mount it...");
+        // Click the image/gallery button in the DM chat bar to mount the hidden file input
+        const imageButtons = document.querySelectorAll('div[role="button"] svg, button svg');
+        for (const svg of imageButtons) {
+          const pathEl = svg.querySelector('path');
+          if (!pathEl) continue;
+          const d = pathEl.getAttribute('d') || '';
+          // Instagram's image/gallery icon typically has these path segments
+          if (d.includes('18.5') || d.includes('7.5') || d.includes('photo') || svg.getAttribute('aria-label')?.toLowerCase()?.includes('photo') || svg.closest('[aria-label]')?.getAttribute('aria-label')?.toLowerCase()?.includes('photo')) {
+            const btn = svg.closest('div[role="button"], button');
+            if (btn) {
+              console.log("[DmDroid DOM] Found image button, clicking...");
+              btn.click();
+              await new Promise(r => setTimeout(r, 1000));
+              break;
+            }
+          }
+        }
+        // Also try aria-label based approach
+        const addPhotoBtn = document.querySelector('[aria-label*="photo" i], [aria-label*="image" i], [aria-label*="gallery" i], [aria-label*="Add Photo" i]');
+        if (addPhotoBtn && !document.querySelector('input[type="file"]')) {
+          console.log("[DmDroid DOM] Found aria-label photo button, clicking...");
+          addPhotoBtn.click();
+          await new Promise(r => setTimeout(r, 1000));
+        }
+        fileInput = document.querySelector('input[type="file"]');
+      }
+      
       if (fileInput) {
+        console.log("[DmDroid DOM] File input found! Setting files...", { accept: fileInput.accept });
         const dataTransfer = new DataTransfer();
         dataTransfer.items.add(file);
         fileInput.files = dataTransfer.files;
         fileInput.dispatchEvent(new Event('change', { bubbles: true }));
+        fileInput.dispatchEvent(new Event('input', { bubbles: true }));
+        console.log("[DmDroid DOM] File input change event dispatched");
+      } else {
+        console.warn("[DmDroid DOM] No file input found. Trying clipboard paste fallback...");
+        // Strategy 2: Clipboard paste fallback
+        try {
+          const messageInput = document.querySelector('div[role="textbox"], div[contenteditable="true"]');
+          if (messageInput) {
+            messageInput.focus();
+            const clipboardData = new DataTransfer();
+            clipboardData.items.add(file);
+            const pasteEvent = new ClipboardEvent('paste', {
+              bubbles: true,
+              cancelable: true,
+              clipboardData: clipboardData
+            });
+            messageInput.dispatchEvent(pasteEvent);
+            console.log("[DmDroid DOM] Clipboard paste event dispatched");
+          } else {
+            console.error("[DmDroid DOM] No textbox found for clipboard fallback either!");
+          }
+        } catch(pasteErr) {
+          console.error("[DmDroid DOM] Clipboard paste fallback failed:", pasteErr);
+        }
       }
     } catch(err) {
-      console.error("DOM Image injection failed:", err);
+      console.error("[DmDroid DOM] Image injection failed:", err);
     }
   }
   async _getText(e, t) {

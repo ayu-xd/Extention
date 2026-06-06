@@ -225,12 +225,41 @@ document.addEventListener('DOMContentLoaded', async () => {
     selectImagesBtn.textContent = 'Saving...';
     selectImagesBtn.disabled = true;
     
+    // Detect real image MIME type from magic bytes (file header)
+    async function detectMimeType(file) {
+      const buffer = await file.slice(0, 12).arrayBuffer();
+      const bytes = new Uint8Array(buffer);
+      // JPEG: FF D8 FF
+      if (bytes[0] === 0xFF && bytes[1] === 0xD8 && bytes[2] === 0xFF) return "image/jpeg";
+      // PNG: 89 50 4E 47
+      if (bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4E && bytes[3] === 0x47) return "image/png";
+      // GIF: 47 49 46 38
+      if (bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x38) return "image/gif";
+      // WebP: 52 49 46 46 ... 57 45 42 50
+      if (bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46 &&
+          bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50) return "image/webp";
+      // BMP: 42 4D
+      if (bytes[0] === 0x42 && bytes[1] === 0x4D) return "image/bmp";
+      // Default to JPEG if unrecognized
+      return "image/jpeg";
+    }
+
     try {
       for (let i = 0; i < files.length; i++) {
         const file = files[i];
-        // Only strip known image extensions so usernames with dots (like 'user.name') aren't truncated if they lack an extension
-        const username = file.name.replace(/\.(png|jpe?g|webp|gif|heic|bmp)$/i, "");
-        await globalThis.ImageStorage.saveImage(username, file);
+        // Strip any file extension (everything after last dot) so the key matches the Instagram username
+        const username = file.name.replace(/\.[^.]+$/, "");
+        
+        // Detect real MIME type (in case file has wrong/missing extension like .sol)
+        let mimeType = file.type;
+        if (!mimeType || !mimeType.startsWith("image/")) {
+          mimeType = await detectMimeType(file);
+          console.log(`[ImageManager] Detected MIME type for "${file.name}": ${mimeType} (original: "${file.type}")`);
+        }
+        
+        // Re-wrap as a Blob with the correct MIME type
+        const correctBlob = new Blob([await file.arrayBuffer()], { type: mimeType });
+        await globalThis.ImageStorage.saveImage(username, correctBlob);
       }
       const newCount = await globalThis.ImageStorage.getAllImagesCount();
       if (imageCountDisplay) imageCountDisplay.textContent = newCount;

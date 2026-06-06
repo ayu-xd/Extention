@@ -445,23 +445,46 @@ async function executeTask(task) {
     let imageArrayBuffer = null;
     let imageType = null;
     
+    debugLog(`[Image Lookup] Starting image lookup for username: "${targetUsername}"`);
+    debugLog(`[Image Lookup] globalThis exists: ${typeof globalThis !== "undefined"} | ImageStorage exists: ${!!globalThis?.ImageStorage}`);
+    
     if (typeof globalThis !== "undefined" && globalThis.ImageStorage) {
-      const img = await globalThis.ImageStorage.getImage(targetUsername);
-      if (img) {
-        hasImage = true;
-        imageUsername = targetUsername;
-        imageType = img.type;
-        // Convert Blob to ArrayBuffer for passing through the Chrome Messaging bridge
-        const arrayBuf = await img.arrayBuffer();
-        // Convert ArrayBuffer to Array for JSON serialization just in case structured cloning fails over MV3 boundaries
-        imageArrayBuffer = Array.from(new Uint8Array(arrayBuf));
-        debugLog(`[Image Manager] Found local image for ${targetUsername}`);
+      try {
+        const totalImages = await globalThis.ImageStorage.getAllImagesCount();
+        debugLog(`[Image Lookup] Total images in DB: ${totalImages}`);
+        
+        const img = await globalThis.ImageStorage.getImage(targetUsername);
+        debugLog(`[Image Lookup] getImage("${targetUsername}") returned: ${img ? `Blob(size=${img.size}, type="${img.type}")` : "null"}`);
+        
+        if (img) {
+          hasImage = true;
+          imageUsername = targetUsername;
+          imageType = img.type || "image/jpeg"; // Fallback if MIME type is empty (e.g. file was saved with non-image extension)
+          // Convert Blob to ArrayBuffer for passing through the Chrome Messaging bridge
+          const arrayBuf = await img.arrayBuffer();
+          // Convert ArrayBuffer to Array for JSON serialization just in case structured cloning fails over MV3 boundaries
+          imageArrayBuffer = Array.from(new Uint8Array(arrayBuf));
+          debugLog(`[Image Manager] Found local image for ${targetUsername} | type=${imageType} | bufferLen=${imageArrayBuffer.length} | sizeKB=${Math.round(imageArrayBuffer.length/1024)}`);
+        } else {
+          debugLog(`[Image Lookup] No image found for "${targetUsername}" — the image may not have been saved or the username key doesn't match`);
+        }
+      } catch(imgErr) {
+        debugLog(`[Image Lookup] ERROR retrieving image: ${imgErr?.toString()}`);
       }
+    } else {
+      debugLog(`[Image Lookup] SKIPPED — ImageStorage not available on globalThis`);
+    }
+
+    // If we have an image but the message template doesn't include [IMAGE], append it
+    let finalMessageText = task.message_text;
+    if (hasImage && !finalMessageText.includes('[IMAGE]')) {
+      finalMessageText = finalMessageText + '\n[IMAGE]';
+      debugLog(`[Image Manager] Message template missing [IMAGE] token — auto-appended`);
     }
 
     const payload = {
       target: { username: targetUsername },
-      message: { text: task.message_text },
+      message: { text: finalMessageText },
       taskId: task.id,
       usePreresolvedNames: usePreresolved,
       hasImage,
@@ -469,6 +492,8 @@ async function executeTask(task) {
       imageType,
       imageArrayBuffer
     };
+
+    debugLog(`[Image Payload] hasImage=${hasImage} | imageType=${imageType} | bufferExists=${!!imageArrayBuffer} | bufferLen=${imageArrayBuffer?.length ?? 0} | msgHasToken=${finalMessageText.includes('[IMAGE]')}`);
     
     const res = await sendTaskToContent("main", "sendMessage", payload);
     if (!res?.success) throw new Error(res?.error?.error || "Send message failed");
@@ -663,12 +688,18 @@ async function sendTaskToContent(tabType, taskType, taskData) {
     await sleep(8000);
   }
 
-  const response = await chrome.tabs.sendMessage(tabId, {
-    type: "adblock:info:to-content",
-    data: { type: taskType, data: taskData }
-  });
-
-  return response;
+  debugLog(`[sendTaskToContent] Sending actual task ${taskType} to tab ${tabId}...`);
+  try {
+    const response = await chrome.tabs.sendMessage(tabId, {
+      type: "adblock:info:to-content",
+      data: { type: taskType, data: taskData }
+    });
+    debugLog(`[sendTaskToContent] Task ${taskType} successfully sent. Response: ${JSON.stringify(response)}`);
+    return response;
+  } catch (err) {
+    debugLog(`[sendTaskToContent] ERROR sending task ${taskType} to tab ${tabId}: ${err.message}`);
+    throw err;
+  }
 }
 
 // ---------------------------------------------------------------------------

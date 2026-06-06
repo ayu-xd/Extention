@@ -201,27 +201,7 @@ class Instagram {
     }, document.documentElement.appendChild(e)
   }
   registerTasks() {
-    this.backgroundConnector.registerTask("sendMessage", async ({
-      target: e,
-      message: t,
-      taskId: s,
-      userId: a,
-      targetUserId: r,
-      useProfile: i,
-      isTakeSnapshot: n,
-      isOpenNewTab: o,
-      skipMessageExistsCheck: c
-    }) => this.tasks.sendMessage({
-      target: e,
-      message: t,
-      taskId: s,
-      userId: a,
-      targetUserId: r,
-      useProfile: i,
-      isTakeSnapshot: n,
-      isOpenNewTab: o,
-      skipMessageExistsCheck: c
-    })), this.backgroundConnector.registerTask("sendMessageFromDialog", async ({
+    this.backgroundConnector.registerTask("sendMessage", async (payload) => this.tasks.sendMessage(payload)), this.backgroundConnector.registerTask("sendMessageFromDialog", async ({
       target: e,
       message: t,
       taskId: s,
@@ -314,21 +294,28 @@ class Instagram {
     })
   }
   async initMain() {
-    return this.log({
-      type: "Opened correct tab",
-      data: {}
-    }), this.injectDOM(), this.log({
-      type: "Dom injected",
-      data: {}
-    }), this.registerTasks(), this.log({
-      type: "Tasks registered",
-      data: {}
-    }), await this.sleep(7e3), await this.domConnector.send("preTaskHooks", {}), await this.registerAccounts(), await this.injectIntoChat(), this.log({
-      type: "Chat handler injected",
-      data: {}
-    }), await this.checkDelayedTask(), this
+    this.isInitializing = true;
+    this.log({ type: "Opened correct tab", data: {} });
+    this.injectDOM();
+    this.log({ type: "Dom injected", data: {} });
+    this.registerTasks();
+    this.log({ type: "Tasks registered", data: {} });
+    await this.sleep(7e3);
+    this.log({ type: "[initMain] Calling preTaskHooks", data: {} });
+    await this.domConnector.send("preTaskHooks", {});
+    this.log({ type: "[initMain] Calling registerAccounts", data: {} });
+    await this.registerAccounts();
+    this.log({ type: "[initMain] Calling injectIntoChat", data: {} });
+    await this.injectIntoChat();
+    this.log({ type: "Chat handler injected", data: {} });
+    this.log({ type: "[initMain] Calling checkDelayedTask", data: {} });
+    await this.checkDelayedTask();
+    this.log({ type: "[initMain] Completed fully", data: {} });
+    this.isInitializing = false;
+    return this;
   }
   async initAdditional() {
+    this.isInitializing = true;
     return this.log({
       type: "[Additional] Opened correct tab",
       data: {}
@@ -341,7 +328,7 @@ class Instagram {
     }), await this.sleep(7e3), await this.domConnector.send("preTaskHooks", {}), await this.injectIntoChat(), this.log({
       type: "[Additional] Chat handler injected",
       data: {}
-    }), this
+    }), this.isInitializing = false, this
   }
   async init() {
     this.backgroundConnector = new BackgroundConnector, this.backgroundConnector.init();
@@ -595,13 +582,22 @@ class Instagram {
       }, {
         attempt: c
       } = {}) => {
+        this.log({ type: "[sendMessage] Task started", data: { taskId: s, isBusy: this.isBusy, isInitializing: this.isInitializing } });
+        
+        // Wait for initMain to finish if it's currently running
+        while (this.isInitializing) {
+          this.log({ type: "[sendMessage] Waiting for initialization to complete...", data: {} });
+          await this.sleep(1000);
+        }
+
         var d, l, h;
         if (this.isBusy) this.log({
           type: "Got send message task but thread is busy",
           data: {}
         });
         else try {
-          if (this.isBusy = !0, this.taskId = s, this._checkIfUserReceivedBlockMessage(), await this.domConnector.send("preTaskHooks", {}), !await this.switchAccountFlow({
+          this.log({ type: "[sendMessage] Entering try block, setting isBusy = true", data: {} });
+          if (this.isBusy = !0, this.taskId = s, this._checkIfUserReceivedBlockMessage(), this.log({ type: "[sendMessage] Calling preTaskHooks", data: {} }), await this.domConnector.send("preTaskHooks", {}), this.log({ type: "[sendMessage] Calling switchAccountFlow", data: {} }), !await this.switchAccountFlow({
               taskType: "sendMessage",
               attempt: c,
               userId: a,
@@ -732,11 +728,29 @@ class Instagram {
                 type: "Prepared message",
                 data: { message: f }
               });
+
+              this.log({
+                type: "IMG_DIAG_1_received",
+                data: {
+                  hasImage: _hasImage,
+                  imageType: _imageType,
+                  bufferIsArray: Array.isArray(_imageArrayBuffer),
+                  bufferLength: _imageArrayBuffer ? _imageArrayBuffer.length : 0,
+                  bufferFirst5: _imageArrayBuffer ? _imageArrayBuffer.slice(0,5) : null,
+                  messageContainsIMAGE: f.includes("[IMAGE]")
+                }
+              });
+
               await this.sleep(5e3);
               
               var _tokens = f.split(/(\[BUBBLE\]|\[IMAGE\])/);
               let imageInjected = false;
               let hasSentAction = false;
+
+              this.log({
+                type: "IMG_DIAG_2_tokens",
+                data: { tokenCount: _tokens.length, tokens: _tokens.map(t => t.substring(0, 40)) }
+              });
 
               for (let i = 0; i < _tokens.length; i++) {
                 var _token = _tokens[i].trim();
@@ -747,12 +761,29 @@ class Instagram {
                 }
 
                 if (_token === "[IMAGE]") {
+                  this.log({
+                    type: "IMG_DIAG_3_image_token_hit",
+                    data: { hasImage: _hasImage, hasBuffer: !!_imageArrayBuffer, hasType: !!_imageType }
+                  });
                   if (_hasImage && _imageArrayBuffer && _imageType) {
-                    this.log({ type: "Injecting Local Image via DOM", data: {} });
-                    await this.domConnector.send("sendImage", { buffer: _imageArrayBuffer, type: _imageType });
-                    await this.sleep(3000); // Instagram needs time to upload the preview
+                    this.log({ type: "Injecting Local Image via DOM", data: { bufferLen: _imageArrayBuffer.length, type: _imageType } });
+                    try {
+                      await this.domConnector.send("sendImage", { buffer: _imageArrayBuffer, type: _imageType });
+                      this.log({ type: "IMG_DIAG_4_sendImage_completed", data: {} });
+                    } catch(imgErr) {
+                      this.log({ type: "IMG_DIAG_4_sendImage_ERROR", data: { error: imgErr?.toString() } });
+                    }
+                    await this.sleep(4000); // Wait for Instagram to upload the preview
+                    
+                    // Trigger the send button to send the image independently!
+                    this.log({ type: "Clicking Send for Image", data: {} });
+                    await this.domConnector.send("sendMessage", {});
+                    await this.sleep(4000); // Wait for the image to actually send
+                    
                     imageInjected = true;
                     hasSentAction = true;
+                  } else {
+                    this.log({ type: "IMG_DIAG_3_SKIPPED_missing_data", data: { hasImage: _hasImage, bufferLen: _imageArrayBuffer?.length, imageType: _imageType } });
                   }
                 } else {
                   try {
@@ -767,11 +798,23 @@ class Instagram {
                 }
               }
 
+              this.log({
+                type: "IMG_DIAG_5_post_loop",
+                data: { imageInjected, hasImage: _hasImage, hasBuffer: !!_imageArrayBuffer, hasType: !!_imageType }
+              });
+
               if (_hasImage && _imageArrayBuffer && _imageType && !imageInjected) {
                  if (hasSentAction) await this.sleep(2000);
-                 this.log({ type: "Injecting Local Image via DOM (Fallback at End)", data: {} });
-                 await this.domConnector.send("sendImage", { buffer: _imageArrayBuffer, type: _imageType });
+                 this.log({ type: "Injecting Local Image via DOM (Fallback at End)", data: { bufferLen: _imageArrayBuffer.length } });
+                 try {
+                   await this.domConnector.send("sendImage", { buffer: _imageArrayBuffer, type: _imageType });
+                   this.log({ type: "IMG_DIAG_6_fallback_completed", data: {} });
+                 } catch(imgErr) {
+                   this.log({ type: "IMG_DIAG_6_fallback_ERROR", data: { error: imgErr?.toString() } });
+                 }
                  await this.sleep(3000);
+              } else if (_hasImage && !imageInjected) {
+                 this.log({ type: "IMG_DIAG_FATAL_image_data_lost_in_transit", data: { hasImage: _hasImage, bufferExists: !!_imageArrayBuffer, typeExists: !!_imageType } });
               }
 
               var w = window.location.href.match(/direct\/t\/(\d+)/)?.[1];
@@ -783,13 +826,15 @@ class Instagram {
                 targetUserId: g?.instagram_id ?? _targetUserId ?? null
               }), !0
             }
+            const unreachableType = g ? u[g.contact_reachability_status_type] : "UNKNOWN";
             this.backgroundConnector.emit("errorTask", {
               error: "User is unreachable",
               errorType: "user_is_unreachable",
-              unreachableType: g ? u[g.contact_reachability_status_type] : "UNKNOWN",
+              unreachableType: unreachableType,
               taskId: s,
               taskType: "sendMessage"
-            })
+            });
+            throw new Error(`User is unreachable: ${unreachableType}`);
           }
         } catch (e) {
           throw await this.screenshot(), this.backgroundConnector.emit("errorTask", {
