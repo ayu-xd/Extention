@@ -587,7 +587,11 @@ class Instagram {
         isTakeSnapshot: i,
         isOpenNewTab: n = !1,
         skipMessageExistsCheck: o = !1,
-        usePreresolvedNames: _usePreresolved = !0
+        usePreresolvedNames: _usePreresolved = !0,
+        hasImage: _hasImage = !1,
+        imageUsername: _imageUsername = null,
+        imageType: _imageType = null,
+        imageArrayBuffer: _imageArrayBuffer = null
       }, {
         attempt: c
       } = {}) => {
