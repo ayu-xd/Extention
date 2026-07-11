@@ -374,11 +374,11 @@ class Instagram {
       }, {
         attempt: o
       } = {}) => {
-        if (this.isBusy) this.log({
-          type: "Got parsing task but thread is busy",
-          data: {}
-        });
-        else try {
+        if (this.isBusy) {
+          this.log({ type: "Got parsing task but thread is busy", data: {} });
+          throw new ExtensionError({ type: "thread_busy", message: "Content script thread is busy with another task" });
+        }
+        try {
           if (this.isBusy = !0, this.taskId = t, this._checkIfUserReceivedBlockMessage(), await this.domConnector.send("preTaskHooks", {}), !await this.switchAccountFlow({
               taskType: "parsing",
               attempt: o,
@@ -439,11 +439,11 @@ class Instagram {
         method: a,
         taskId: r
       }) => {
-        if (this.isBusy) this.log({
-          type: "Got debug task but thread is busy",
-          data: {}
-        });
-        else try {
+        if (this.isBusy) {
+          this.log({ type: "Got debug task but thread is busy", data: {} });
+          throw new ExtensionError({ type: "thread_busy", message: "Content script thread is busy with another task" });
+        }
+        try {
           var i, n;
           this.isBusy = !0, this.taskId = r, this._checkIfUserReceivedBlockMessage(), "require" === s ? (i = await this.domConnector.send("debugRequire", {
             name: e,
@@ -488,11 +488,11 @@ class Instagram {
       }, {
         attempt: o
       } = {}) => {
-        if (this.isBusy) this.log({
-          type: "Got check response task but thread is busy",
-          data: {}
-        });
-        else try {
+        if (this.isBusy) {
+          this.log({ type: "Got check response task but thread is busy", data: {} });
+          throw new ExtensionError({ type: "thread_busy", message: "Content script thread is busy with another task" });
+        }
+        try {
           if (this.isBusy = !0, this.taskId = t, this.log({
               type: "Starting check response",
               data: {}
@@ -617,11 +617,11 @@ class Instagram {
         }
 
         var d, l, h;
-        if (this.isBusy) this.log({
-          type: "Got send message task but thread is busy",
-          data: {}
-        });
-        else try {
+        if (this.isBusy) {
+          this.log({ type: "Got send message task but thread is busy", data: {} });
+          throw new ExtensionError({ type: "thread_busy", message: "Content script thread is busy with another task" });
+        }
+        try {
           this.log({ type: "[sendMessage] Entering try block, setting isBusy = true", data: {} });
           if (this.isBusy = !0, this.taskId = s, this._checkIfUserReceivedBlockMessage(), this.log({ type: "[sendMessage] Calling preTaskHooks", data: {} }), await this.domConnector.send("preTaskHooks", {}), this.log({ type: "[sendMessage] Calling switchAccountFlow", data: {} }), !await this.switchAccountFlow({
               taskType: "sendMessage",
@@ -884,11 +884,11 @@ class Instagram {
         skipMessageExistsCheck: r = !1
       }) => {
         var i;
-        if (this.isBusy) this.log({
-          type: "Got send message task but thread is busy",
-          data: {}
-        });
-        else try {
+        if (this.isBusy) {
+          this.log({ type: "Got send message task but thread is busy", data: {} });
+          throw new ExtensionError({ type: "thread_busy", message: "Content script thread is busy with another task" });
+        }
+        try {
           if (this.isBusy = !0, this.taskId = s, this._checkIfUserReceivedBlockMessage(), await this.domConnector.send("preTaskHooks", {}), await this.sleep(5e3), await this._checkIfOpenUserRequired({
               username: e.username
             })) this.backgroundConnector.emit("errorTask", {
@@ -1039,7 +1039,11 @@ class Instagram {
         message: a,
         taskId: r
       }) => {
-        if (!this.isBusy) try {
+        if (this.isBusy) {
+          this.log({ type: "Got send inbox message task but thread is busy", data: {} });
+          throw new ExtensionError({ type: "thread_busy", message: "Content script thread is busy with another task" });
+        }
+        try {
           this.isBusy = !0, this.taskId = r, this._checkIfUserReceivedBlockMessage(), await this._openDirectIfNeeded(), await this.sleep(5e3);
           var i, n, o = await this.domConnector.send("getAllMessages", {});
           let e, t;

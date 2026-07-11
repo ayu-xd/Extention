@@ -237,11 +237,23 @@ async function handleConnect(browserId, browserLabel) {
   }
 }
 
-function startEngine() {
+async function startEngine() {
   stopEngine();
   console.log(`Starting Engine with Browser ID: ${state.browserId}`);
   debugLog(`Engine started for ${state.browserLabel}`);
-  
+
+  // Reset any tasks stuck in "processing" back to "pending" (crash recovery)
+  if (state.browserId) {
+    try {
+      const stale = await supabaseReq(`dm_tasks?browser_instance_id=eq.${state.browserId}&status=eq.processing`, "PATCH", { status: "pending" });
+      if (stale && stale.length > 0) {
+        debugLog(`[Recovery] Reset ${stale.length} stuck processing task(s) back to pending`);
+      }
+    } catch (err) {
+      debugLog(`[Recovery] Failed to reset stale tasks: ${err.message}`);
+    }
+  }
+
   // Create alarms for Manifest V3 background script
   chrome.alarms.create("engine_heartbeat", { periodInMinutes: 1 });
   chrome.alarms.create("engine_poll", { periodInMinutes: 0.25 }); // 15 seconds
@@ -256,7 +268,6 @@ function stopEngine() {
   chrome.alarms.clear("engine_heartbeat");
   chrome.alarms.clear("engine_poll");
   chrome.alarms.clear("engine_refresh_token");
-  state.isProcessing = false;
   console.log("Engine stopped.");
 }
 
@@ -366,7 +377,7 @@ async function pollTasks() {
     delete task.campaigns;
 
     if (task.contact_id) {
-      const contacts = await supabaseReq(`contacts?select=username,image_url&id=eq.${task.contact_id}`);
+      const contacts = await supabaseReq(`contacts?select=username&id=eq.${task.contact_id}`);
       if (contacts && contacts.length > 0) {
         task.contacts = contacts[0];
       }
@@ -376,6 +387,7 @@ async function pollTasks() {
 
     debugLog(`Processing task: ${task.task_type}`);
 
+    let taskSucceeded = false;
     try {
       await executeTask(task);
 
@@ -385,45 +397,47 @@ async function pollTasks() {
       });
 
       if (task.contact_id && task.task_type === 'first_dm') {
-        const nowIso = new Date().toISOString();
         await supabaseReq(`contacts?id=eq.${task.contact_id}`, "PATCH", {
           status: "dmed",
-          dmed_at: nowIso
+          dmed_at: new Date().toISOString()
         });
-        if (task.campaign_id) {
-          await supabaseReq(`contact_campaign_pipeline?contact_id=eq.${task.contact_id}&campaign_id=eq.${task.campaign_id}`, "PATCH", {
-            status: "dmed",
-            dmed_at: nowIso
-          });
-        }
       }
 
       state.stats.completed++;
+      taskSucceeded = true;
       debugLog(`Task Completed: ${task.task_type}`);
     } catch (err) {
       console.error("Task failed:", err);
-      await supabaseReq(`dm_tasks?id=eq.${task.id}`, "PATCH", {
-        status: "failed",
-        error_reason: err.message || String(err)
-      });
-      state.stats.failed++;
-      debugLog(`Task Failed: ${err.message}`);
+      const isThreadBusy = err.message?.includes("thread is busy");
+      if (isThreadBusy) {
+        // Re-queue as pending instead of failing — will be retried on next poll
+        await supabaseReq(`dm_tasks?id=eq.${task.id}`, "PATCH", { status: "pending" });
+        debugLog(`[Recovery] Task ${task.task_type} re-queued as pending (thread was busy)`);
+      } else {
+        await supabaseReq(`dm_tasks?id=eq.${task.id}`, "PATCH", {
+          status: "failed",
+          error_reason: err.message || String(err)
+        });
+        state.stats.failed++;
+        debugLog(`Task Failed: ${err.message}`);
+      }
     }
 
     await chrome.storage.local.set({ stats: state.stats });
     chrome.runtime.sendMessage({ type: "STATS_UPDATE", stats: state.stats }).catch(()=>null);
 
-    if (task.task_type === 'first_dm' || task.task_type === 'followup_1a') {
+    // Only apply pacing delay and daily limit increment on actual success
+    if (taskSucceeded && (task.task_type === 'first_dm' || task.task_type === 'followup_1a')) {
       await incrementDailyLimit();
+
+      const extra = randomInt(limitCheck.settings.minVariance, limitCheck.settings.maxVariance);
+      const delayMs = Math.max(0, limitCheck.settings.baseDelay + extra) * 1000;
+
+      debugLog(`[Pacing] Sleeping for ${Math.round(delayMs/1000)}s...`);
+
+      const wakeUpAt = Date.now() + delayMs;
+      await chrome.storage.local.set({ wakeUpAt });
     }
-
-    const extra = randomInt(limitCheck.settings.minVariance, limitCheck.settings.maxVariance);
-    const delayMs = Math.max(0, limitCheck.settings.baseDelay + extra) * 1000;
-
-    debugLog(`[Pacing] Sleeping for ${Math.round(delayMs/1000)}s...`);
-
-    const wakeUpAt = Date.now() + delayMs;
-    await chrome.storage.local.set({ wakeUpAt });
 
   } catch (err) {
     console.error("Polling error:", err);
@@ -450,51 +464,33 @@ async function executeTask(task) {
     let imageType = null;
     
     debugLog(`[Image Lookup] Starting image lookup for username: "${targetUsername}"`);
-
-    // Prioritize Server-Side Image URL
-    if (task.contacts?.image_url) {
-        try {
-            debugLog(`[Image Lookup] Found server-side image URL: ${task.contacts.image_url}`);
-            const response = await fetch(task.contacts.image_url);
-            if (!response.ok) throw new Error(`HTTP ${response.status}`);
-            const arrayBuf = await response.arrayBuffer();
-            imageArrayBuffer = Array.from(new Uint8Array(arrayBuf));
-            hasImage = true;
-            imageUsername = targetUsername;
-            imageType = response.headers.get("content-type") || "image/jpeg";
-            debugLog(`[Image Manager] Successfully downloaded image | size=${imageArrayBuffer.length} | type=${imageType}`);
-        } catch (fetchErr) {
-            debugLog(`[Image Lookup] Fetch error: ${fetchErr.message}. Falling back to local storage scan.`);
-        }
-    }
-
-    // Fallback to Local Extension Zip Storage if not fetched successfully
-    if (!hasImage) {
-        debugLog(`[Image Lookup] globalThis exists: ${typeof globalThis !== "undefined"} | ImageStorage exists: ${!!globalThis?.ImageStorage}`);
-        if (typeof globalThis !== "undefined" && globalThis.ImageStorage) {
-            try {
-                const totalImages = await globalThis.ImageStorage.getAllImagesCount();
-                debugLog(`[Image Lookup] Total images in DB: ${totalImages}`);
-
-                const img = await globalThis.ImageStorage.getImage(targetUsername);
-                debugLog(`[Image Lookup] getImage("${targetUsername}") returned: ${img ? `Blob(size=${img.size}, type="${img.type}")` : "null"}`);
-
-                if (img) {
-                    hasImage = true;
-                    imageUsername = targetUsername;
-                    imageType = img.type || "image/jpeg";
-                    const arrayBuf = await img.arrayBuffer();
-                    imageArrayBuffer = Array.from(new Uint8Array(arrayBuf));
-                    debugLog(`[Image Manager] Found local image for ${targetUsername} | type=${imageType} | bufferLen=${imageArrayBuffer.length} | sizeKB=${Math.round(imageArrayBuffer.length/1024)}`);
-                } else {
-                    debugLog(`[Image Lookup] No local image found for "${targetUsername}"`);
-                }
-            } catch (imgErr) {
-                debugLog(`[Image Lookup] ERROR retrieving local image: ${imgErr?.toString()}`);
-            }
+    debugLog(`[Image Lookup] globalThis exists: ${typeof globalThis !== "undefined"} | ImageStorage exists: ${!!globalThis?.ImageStorage}`);
+    
+    if (typeof globalThis !== "undefined" && globalThis.ImageStorage) {
+      try {
+        const totalImages = await globalThis.ImageStorage.getAllImagesCount();
+        debugLog(`[Image Lookup] Total images in DB: ${totalImages}`);
+        
+        const img = await globalThis.ImageStorage.getImage(targetUsername);
+        debugLog(`[Image Lookup] getImage("${targetUsername}") returned: ${img ? `Blob(size=${img.size}, type="${img.type}")` : "null"}`);
+        
+        if (img) {
+          hasImage = true;
+          imageUsername = targetUsername;
+          imageType = img.type || "image/jpeg"; // Fallback if MIME type is empty (e.g. file was saved with non-image extension)
+          // Convert Blob to ArrayBuffer for passing through the Chrome Messaging bridge
+          const arrayBuf = await img.arrayBuffer();
+          // Convert ArrayBuffer to Array for JSON serialization just in case structured cloning fails over MV3 boundaries
+          imageArrayBuffer = Array.from(new Uint8Array(arrayBuf));
+          debugLog(`[Image Manager] Found local image for ${targetUsername} | type=${imageType} | bufferLen=${imageArrayBuffer.length} | sizeKB=${Math.round(imageArrayBuffer.length/1024)}`);
         } else {
-            debugLog(`[Image Lookup] SKIPPED — Local ImageStorage not available on globalThis`);
+          debugLog(`[Image Lookup] No image found for "${targetUsername}" — the image may not have been saved or the username key doesn't match`);
         }
+      } catch(imgErr) {
+        debugLog(`[Image Lookup] ERROR retrieving image: ${imgErr?.toString()}`);
+      }
+    } else {
+      debugLog(`[Image Lookup] SKIPPED — ImageStorage not available on globalThis`);
     }
 
     // If we have an image but the message template doesn't include [IMAGE], append it
@@ -518,7 +514,7 @@ async function executeTask(task) {
     debugLog(`[Image Payload] hasImage=${hasImage} | imageType=${imageType} | bufferExists=${!!imageArrayBuffer} | bufferLen=${imageArrayBuffer?.length ?? 0} | msgHasToken=${finalMessageText.includes('[IMAGE]')}`);
     
     const res = await sendTaskToContent("main", "sendMessage", payload);
-    if (!res?.success) throw new Error(res?.error?.error || "Send message failed");
+    if (!res?.success || res?.result !== true) throw new Error(res?.error?.error || "Send message failed or returned no result");
     return true;
   } 
   else if (task.task_type === 'scrape_followers' || task.task_type === 'scrape_following') {
