@@ -161,6 +161,10 @@ class BackgroundConnector extends AsyncEventEmitter {
       }
       throw console.error("Error while sending to background", a), a
     }
+    if (!s) {
+      var n = new Error("Background did not respond to task: " + e);
+      throw n;
+    }
     if (s.success) return s.result;
     var a = new Error(s.error.error);
     throw a.stack = s.error.stack, a
@@ -191,14 +195,18 @@ class Instagram {
   sleep(t) {
     return t < 2e4 ? this.backgroundConnector.send("sleep", {
       time: t
-    }) : new Promise(e => setTimeout(e, t))
+    }).catch(() => new Promise(e => setTimeout(e, t))) : new Promise(e => setTimeout(e, t))
   }
   injectDOM() {
     this.domConnector = new DOMConnector;
     var e = document.createElement("script");
     e.src = chrome.runtime.getURL("assets/dom.js"), e.async = !1, e.onload = function() {
       this.remove()
-    }, document.documentElement.appendChild(e)
+    }, document.documentElement.appendChild(e);
+    var r = document.createElement("script");
+    r.src = chrome.runtime.getURL("assets/ReadReceipts.js"), r.async = !1, r.onload = function() {
+      this.remove()
+    }, document.documentElement.appendChild(r)
   }
   registerTasks() {
     this.backgroundConnector.registerTask("sendMessage", async (payload) => this.tasks.sendMessage(payload)), this.backgroundConnector.registerTask("sendMessageFromDialog", async ({
@@ -280,6 +288,25 @@ class Instagram {
       taskId: s
     }))
   }
+  _getReadReceipts() {
+    return new Promise((resolve) => {
+      let resolved = false;
+      const handler = (event) => {
+        if (event.source !== window || event.data?.type !== "readreceipts:response") return;
+        window.removeEventListener("message", handler);
+        resolved = true;
+        resolve(event.data.data || []);
+      };
+      window.addEventListener("message", handler);
+      window.postMessage({ type: "readreceipts:request" }, "*");
+      setTimeout(() => {
+        if (!resolved) {
+          window.removeEventListener("message", handler);
+          resolve([]);
+        }
+      }, 15000);
+    });
+  }
   log({
     data: e,
     type: t
@@ -301,7 +328,7 @@ class Instagram {
       this.log({ type: "Dom injected", data: {} });
       this.registerTasks();
       this.log({ type: "Tasks registered", data: {} });
-      await this.sleep(7e3);
+      await this.sleep(7e3).catch(e => this.log({ type: "[initMain] sleep error", data: { error: e?.message } }));
       this.log({ type: "[initMain] Calling preTaskHooks", data: {} });
       await this.domConnector.send("preTaskHooks", {}).catch(e => this.log({ type: "[initMain] preTaskHooks error", data: { error: e?.message } }));
       this.log({ type: "[initMain] Calling registerAccounts", data: {} });
@@ -327,7 +354,7 @@ class Instagram {
       this.log({ type: "[Additional] Dom injected", data: {} });
       this.registerTasks();
       this.log({ type: "[Additional] Tasks registered", data: {} });
-      await this.sleep(7e3);
+      await this.sleep(7e3).catch(e => this.log({ type: "[Additional] sleep error", data: { error: e?.message } }));
       await this.domConnector.send("preTaskHooks", {}).catch(e => this.log({ type: "[Additional] preTaskHooks error", data: { error: e?.message } }));
       await this.injectIntoChat().catch(e => this.log({ type: "[Additional] injectIntoChat error", data: { error: e?.message } }));
       this.log({ type: "[Additional] Chat handler injected", data: {} });
@@ -608,7 +635,7 @@ class Instagram {
         let initWaitElapsed = 0;
         while (this.isInitializing && initWaitElapsed < 60) {
           this.log({ type: "[sendMessage] Waiting for initialization to complete...", data: { elapsed: initWaitElapsed } });
-          await this.sleep(1000);
+          await this.sleep(1000).catch(() => {});
           initWaitElapsed++;
         }
         if (this.isInitializing) {
@@ -1019,19 +1046,25 @@ class Instagram {
       },
       collectMessages: async () => {
         try {
-          var e, t = await this.domConnector.send("getAllMessages", {});
-          if (0 !== Object.keys(t).length) return e = await this.domConnector.send("getUser", {}), await this.backgroundConnector.send("saveMessages", {
-            messages: t,
-            instagram_account_id: e.id
-          }), !0
+          var e = await this.domConnector.send("getUser", {});
+          var readReceipts = await this._getReadReceipts();
+          if (readReceipts.length > 0) {
+            await this.backgroundConnector.send("saveMessages", {
+              readReceipts: readReceipts,
+              instagram_account_id: e.id
+            });
+          }
+          var t = await this.domConnector.send("getAllMessages", {});
+          return t || {};
         } catch (e) {
-          throw this.log({
+          this.log({
             type: "collect_messages_error",
             data: {
               error: e?.toString(),
               stack: e?.stack
             }
-          }), e
+          });
+          return {};
         }
       },
       sendInboxMessage: async ({

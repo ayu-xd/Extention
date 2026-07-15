@@ -12,7 +12,8 @@ let state = {
   isProcessing: false,
   processingLockAcquiredAt: 0,
   mainTabId: null,
-  additionalTabId: null
+  additionalTabId: null,
+  lastTaskCompletedAt: 0
 };
 
 async function persistDebugLog(msg) {
@@ -120,7 +121,7 @@ async function refreshAccessToken() {
 // ---------------------------------------------------------------------------
 
 async function init() {
-  const data = await chrome.storage.local.get(['accessToken', 'refreshToken', 'browserId', 'browserLabel', 'stats', 'mainTabId', 'additionalTabId']);
+  const data = await chrome.storage.local.get(['accessToken', 'refreshToken', 'browserId', 'browserLabel', 'stats', 'mainTabId', 'additionalTabId', 'enginePaused']);
   if (data.accessToken) state.accessToken = data.accessToken;
   if (data.refreshToken) state.refreshToken = data.refreshToken;
   if (data.browserId) state.browserId = data.browserId;
@@ -128,6 +129,17 @@ async function init() {
   if (data.stats) state.stats = data.stats;
   if (data.mainTabId) state.mainTabId = data.mainTabId;
   if (data.additionalTabId) state.additionalTabId = data.additionalTabId;
+
+  // Heartbeat runs 24/7 — even when paused — so the web app knows the browser is online
+  if (state.browserId) {
+    chrome.alarms.create("engine_heartbeat", { periodInMinutes: 1 });
+    sendHeartbeat().catch(()=>{});
+  }
+
+  if (data.enginePaused) {
+    debugLog("[Init] Engine is paused, skipping task engine auto-start.");
+    return;
+  }
 
   if (state.refreshToken && state.browserId) {
     const refreshed = await refreshAccessToken();
@@ -254,20 +266,20 @@ async function startEngine() {
     }
   }
 
-  // Create alarms for Manifest V3 background script
-  chrome.alarms.create("engine_heartbeat", { periodInMinutes: 1 });
+  // Create alarms for Manifest V3 background script (heartbeat is separate — created in init)
   chrome.alarms.create("engine_poll", { periodInMinutes: 0.25 }); // 15 seconds
   chrome.alarms.create("engine_refresh_token", { periodInMinutes: 45 }); // Refresh JWT every 45 min
+  chrome.alarms.create("engine_collect_messages", { periodInMinutes: 2 }); // Every 2 min read-receipt check
 
   // Trigger initial runs
-  sendHeartbeat();
   pollTasks();
 }
 
 function stopEngine() {
-  chrome.alarms.clear("engine_heartbeat");
+  // NOTE: engine_heartbeat is NOT cleared here — it runs 24/7 so the web app knows the browser is online
   chrome.alarms.clear("engine_poll");
   chrome.alarms.clear("engine_refresh_token");
+  chrome.alarms.clear("engine_collect_messages");
   console.log("Engine stopped.");
 }
 
@@ -279,8 +291,70 @@ chrome.alarms.onAlarm.addListener((alarm) => {
     pollTasks().catch(()=>{});
   } else if (alarm.name === "engine_refresh_token") {
     refreshAccessToken().catch(()=>{});
+  } else if (alarm.name === "engine_collect_messages") {
+    collectMessagesJob().catch(()=>{});
   }
 });
+
+async function collectMessagesJob() {
+  if (!state.browserId || state.isProcessing) return;
+  const pauseData = await chrome.storage.local.get('enginePaused');
+  if (pauseData.enginePaused) return;
+  if (!state.mainTabId) return;
+
+  if (state.lastTaskCompletedAt && Date.now() - state.lastTaskCompletedAt < 60000) {
+    debugLog("[Collector] Skipping — a DM was sent less than 60s ago, waiting for Instagram to settle.");
+    return;
+  }
+
+  try {
+    debugLog("[Collector] Running periodic read-receipt check via React Fiber...");
+    await chrome.tabs.sendMessage(state.mainTabId, {
+      type: "adblock:info:to-content",
+      isEmit: true,
+      data: { type: "collectMessages", data: {} }
+    }).catch(() => null);
+  } catch (err) {
+    debugLog(`[Collector] Error triggering collectMessages: ${err.message}`);
+  }
+}
+
+async function processCollectedMessages(readReceipts) {
+  try {
+    if (!Array.isArray(readReceipts) || readReceipts.length === 0) return;
+
+    const seenUsernames = new Set();
+    let seenCount = 0;
+    let replyCount = 0;
+
+    for (const entry of readReceipts) {
+      if (!entry || !entry.username) continue;
+
+      if (entry.hasSeen || entry.hasReply) {
+        seenUsernames.add(entry.username.toLowerCase());
+        if (entry.hasSeen) seenCount++;
+        if (entry.hasReply) replyCount++;
+      }
+    }
+
+    if (seenUsernames.size > 0) {
+      const userList = Array.from(seenUsernames);
+      debugLog(`[Collector] Found ${userList.length} contact(s) — ${seenCount} seen, ${replyCount} replied.`);
+
+      for (let i = 0; i < userList.length; i += 50) {
+        const chunk = userList.slice(i, i + 50);
+        const inQuery = chunk.map(u => `"${u}"`).join(",");
+        await supabaseReq(
+          `contacts?media_seen=eq.false&username=in.(${inQuery})`,
+          "PATCH",
+          { media_seen: true, media_seen_at: new Date().toISOString() }
+        );
+      }
+    }
+  } catch (err) {
+    debugLog(`[Collector] Error processing collected messages: ${err.message}`);
+  }
+}
 
 async function sendHeartbeat() {
   if (!state.browserId) return;
@@ -308,7 +382,7 @@ async function checkDailyLimit() {
   
   if (stats.date !== new Date().toDateString()) {
     stats = { date: new Date().toDateString(), sent: 0 };
-    await chrome.storage.local.set({ dailyStats: stats, enginePaused: false });
+    await chrome.storage.local.set({ dailyStats: stats });
   }
   
   return {
@@ -389,7 +463,12 @@ async function pollTasks() {
 
     let taskSucceeded = false;
     try {
-      await executeTask(task);
+      const result = await executeTask(task);
+
+      if (result?.isLimited) {
+        debugLog("[Pacing] Rate limit detected from content script! Pausing engine to prevent ban.");
+        await chrome.storage.local.set({ enginePaused: true });
+      }
 
       await supabaseReq(`dm_tasks?id=eq.${task.id}`, "PATCH", {
         status: "completed",
@@ -399,27 +478,75 @@ async function pollTasks() {
       if (task.contact_id && task.task_type === 'first_dm') {
         await supabaseReq(`contacts?id=eq.${task.contact_id}`, "PATCH", {
           status: "dmed",
-          dmed_at: new Date().toISOString()
+          dmed_at: new Date().toISOString(),
+          assigned_browser_id: state.browserId
+        });
+      } else if (task.contact_id && task.task_type.startsWith('followup_')) {
+        const stepLetter = task.task_type.replace('followup_1', '').toUpperCase() || 'A';
+        await supabaseReq(`contacts?id=eq.${task.contact_id}`, "PATCH", {
+          followup_1a_sent: true,
+          current_follow_up: `1${stepLetter}`,
+          last_follow_up_at: new Date().toISOString()
         });
       }
 
       state.stats.completed++;
+      state.lastTaskCompletedAt = Date.now();
       taskSucceeded = true;
       debugLog(`Task Completed: ${task.task_type}`);
     } catch (err) {
       console.error("Task failed:", err);
       const isThreadBusy = err.message?.includes("thread is busy");
       if (isThreadBusy) {
-        // Re-queue as pending instead of failing — will be retried on next poll
+        // Re-queue as pending without increasing retry count (thread was busy with hooks)
         await supabaseReq(`dm_tasks?id=eq.${task.id}`, "PATCH", { status: "pending" });
         debugLog(`[Recovery] Task ${task.task_type} re-queued as pending (thread was busy)`);
       } else {
-        await supabaseReq(`dm_tasks?id=eq.${task.id}`, "PATCH", {
-          status: "failed",
-          error_reason: err.message || String(err)
-        });
-        state.stats.failed++;
-        debugLog(`Task Failed: ${err.message}`);
+        const isPermanentError = [
+          "user_is_unreachable",
+          "user_not_found",
+          "cannot_message_user",
+          "account_disabled",
+          "rate_limited_error"
+        ].includes(err.unreachableType);
+
+        const currentRetries = Number(task.retry_count || 0);
+
+        if (!isPermanentError && currentRetries < 3) {
+          const nextRetry = currentRetries + 1;
+          debugLog(`[Retry Engine] Transient error on task ${task.id} (${err.message}). Retrying (${nextRetry}/3)...`);
+          
+          await supabaseReq(`dm_tasks?id=eq.${task.id}`, "PATCH", {
+            status: "pending",
+            retry_count: nextRetry,
+            error_reason: `[Attempt ${nextRetry}/3] ${err.message || String(err)}`
+          });
+
+          // Short 30s backoff delay before retrying transient failures
+          const wakeUpAt = Date.now() + 30000;
+          await chrome.storage.local.set({ wakeUpAt });
+        } else {
+          // Permanent error OR max retries reached -> mark as failed
+          await supabaseReq(`dm_tasks?id=eq.${task.id}`, "PATCH", {
+            status: "failed",
+            error_reason: currentRetries >= 3 
+              ? `Failed after 3 retries. Last error: ${err.message || String(err)}`
+              : (err.message || String(err)),
+            unreachable_type: err.unreachableType || null
+          });
+          
+          if (err.unreachableType === "rate_limited_error") {
+            debugLog("[Pacing] Rate limit error detected! Pausing engine to prevent ban.");
+            await chrome.storage.local.set({ enginePaused: true });
+          } else if (err.unreachableType && task.contact_id) {
+            await supabaseReq(`contacts?id=eq.${task.contact_id}`, "PATCH", {
+              status: "unreachable"
+            });
+          }
+
+          state.stats.failed++;
+          debugLog(`Task Permanently Failed: ${err.message} ${err.unreachableType ? `[${err.unreachableType}]` : ''}`);
+        }
       }
     }
 
@@ -427,7 +554,7 @@ async function pollTasks() {
     chrome.runtime.sendMessage({ type: "STATS_UPDATE", stats: state.stats }).catch(()=>null);
 
     // Only apply pacing delay and daily limit increment on actual success
-    if (taskSucceeded && (task.task_type === 'first_dm' || task.task_type === 'followup_1a')) {
+    if (taskSucceeded && (task.task_type === 'first_dm' || task.task_type.startsWith('followup_'))) {
       await incrementDailyLimit();
 
       const extra = randomInt(limitCheck.settings.minVariance, limitCheck.settings.maxVariance);
@@ -451,7 +578,7 @@ async function pollTasks() {
 // ---------------------------------------------------------------------------
 
 async function executeTask(task) {
-  if (task.task_type === 'first_dm' || task.task_type === 'followup_1a') {
+  if (task.task_type === 'first_dm') {
     const targetUsername = task.contacts?.username;
     if (!targetUsername) throw new Error("Missing target username in contact relation");
 
@@ -512,105 +639,283 @@ async function executeTask(task) {
     };
 
     debugLog(`[Image Payload] hasImage=${hasImage} | imageType=${imageType} | bufferExists=${!!imageArrayBuffer} | bufferLen=${imageArrayBuffer?.length ?? 0} | msgHasToken=${finalMessageText.includes('[IMAGE]')}`);
-    
-    const res = await sendTaskToContent("main", "sendMessage", payload);
-    if (!res?.success || res?.result !== true) throw new Error(res?.error?.error || "Send message failed or returned no result");
-    return true;
-  } 
-  else if (task.task_type === 'scrape_followers' || task.task_type === 'scrape_following') {
-    return new Promise(async (resolve, reject) => {
+    return new Promise((resolve, reject) => {
       let resolved = false;
 
-      const handler = async (message) => {
+      const handler = (message, sender) => {
+        if (sender.tab?.id !== state.mainTabId) return;
         if (message.type === "adblock:info:to-background" && message.isEmit) {
           const payload = message.data;
           if (payload.type === "successTask" && payload.data.taskId === task.id) {
             if (resolved) return;
             resolved = true;
             chrome.runtime.onMessage.removeListener(handler);
-            
-            try {
-              const targets = payload.data.targets;
-              if (targets && targets.length > 0) {
-                // 1. Create Target List
-                const params = JSON.parse(task.message_text);
-                const typeStr = task.task_type === 'scrape_followers' ? "followers" : "following";
-                
-                const listRes = await supabaseReq(`target_lists`, "POST", {
-                  user_id: task.user_id,
-                  name: `Scraped: ${params.target} (${typeStr})`,
-                  type: "raw",
-                  count: targets.length
-                });
+            clearTimeout(timeoutId);
 
-                if (listRes && listRes.length > 0) {
-                  const listId = listRes[0].id;
-                  
-                  // 2. Insert Contacts (batch of 1000 max to avoid payload limits)
-                  let contactIds = [];
-                  for (let i = 0; i < targets.length; i += 1000) {
-                    const chunk = targets.slice(i, i + 1000);
-                    const contactsToInsert = chunk.map(t => ({
-                      user_id: task.user_id,
-                      username: t.username,
-                      full_name: t.fullName || t.username,
-                      profile_link: `https://instagram.com/${t.username}`,
-                      status: 'not_started'
-                    }));
-                    
-                    const cRes = await supabaseReq(`contacts?select=id`, "POST", contactsToInsert);
-                    if (cRes) contactIds = contactIds.concat(cRes.map(c => c.id));
-                  }
-
-                  // 3. Link Contacts to Target List
-                  for (let i = 0; i < contactIds.length; i += 1000) {
-                    const chunk = contactIds.slice(i, i + 1000);
-                    const links = chunk.map(cId => ({
-                      target_list_id: listId,
-                      contact_id: cId
-                    }));
-                    await supabaseReq(`target_list_items`, "POST", links);
-                  }
+            const data = payload.data;
+            (async () => {
+              try {
+                if (data.threadId) {
+                  await supabaseReq(`dm_tasks?id=eq.${task.id}`, "PATCH", {
+                    thread_id: data.threadId,
+                    last_message_id: data.lastMessageId || null,
+                    last_message_ts: data.lastMessageTimestamp || new Date().toISOString(),
+                    is_limited: !!data.isLimited
+                  });
                 }
+                resolve({ isLimited: !!data.isLimited });
+              } catch (err) {
+                resolve({ isLimited: !!data.isLimited });
               }
-              resolve(true);
-            } catch (err) {
-              reject(err);
-            }
+            })();
           } else if (payload.type === "errorTask" && payload.data.taskId === task.id) {
             if (resolved) return;
             resolved = true;
             chrome.runtime.onMessage.removeListener(handler);
+            clearTimeout(timeoutId);
+
+            const errReason = payload.data.error || "DM failed";
+            const errType = payload.data.unreachableType || null;
+
+            const errObj = new Error(errReason);
+            errObj.unreachableType = errType;
+            reject(errObj);
+          }
+        }
+      };
+
+      const timeoutId = setTimeout(() => {
+        if (!resolved) {
+          resolved = true;
+          chrome.runtime.onMessage.removeListener(handler);
+          reject(new Error("Task timed out waiting for content script response"));
+        }
+      }, 300000);
+
+      chrome.runtime.onMessage.addListener(handler);
+
+      (async () => {
+        try {
+          const res = await sendTaskToContent("main", "sendMessage", payload);
+          if (!res?.success) {
+            if (!resolved) {
+              resolved = true;
+              chrome.runtime.onMessage.removeListener(handler);
+              clearTimeout(timeoutId);
+              reject(new Error(res?.error?.error || "Send message failed to start"));
+            }
+          }
+        } catch (err) {
+          if (!resolved) {
+            resolved = true;
+            chrome.runtime.onMessage.removeListener(handler);
+            clearTimeout(timeoutId);
+            reject(err);
+          }
+        }
+      })();
+    });
+  }
+  else if (task.task_type.startsWith('followup_')) {
+    const targetUsername = task.contacts?.username;
+    if (!targetUsername) throw new Error("Missing target username in contact relation");
+
+    let targetUrl = null;
+    if (task.thread_id) {
+      targetUrl = `https://www.instagram.com/direct/t/${task.thread_id}/`;
+      debugLog(`[Followup] Using direct thread URL for ${targetUsername}: ${targetUrl}`);
+    }
+
+    const payload = {
+      target: { username: targetUsername },
+      message: { text: task.message_text },
+      taskId: task.id,
+      usePreresolvedNames: true,
+      skipMessageExistsCheck: true
+    };
+
+    return new Promise((resolve, reject) => {
+      let resolved = false;
+
+      const handler = (message, sender) => {
+        if (sender.tab?.id !== state.additionalTabId) return;
+        if (message.type === "adblock:info:to-background" && message.isEmit) {
+          const payload = message.data;
+          if (payload.type === "successTask" && payload.data.taskId === task.id) {
+            if (resolved) return;
+            resolved = true;
+            chrome.runtime.onMessage.removeListener(handler);
+            clearTimeout(timeoutId);
+
+            const data = payload.data;
+            (async () => {
+              try {
+                if (data.threadId) {
+                  await supabaseReq(`dm_tasks?id=eq.${task.id}`, "PATCH", {
+                    thread_id: data.threadId,
+                    last_message_id: data.lastMessageId || null,
+                    last_message_ts: data.lastMessageTimestamp || new Date().toISOString(),
+                    is_limited: !!data.isLimited
+                  });
+                }
+                resolve({ isLimited: !!data.isLimited });
+              } catch (err) {
+                resolve({ isLimited: !!data.isLimited });
+              }
+            })();
+          } else if (payload.type === "errorTask" && payload.data.taskId === task.id) {
+            if (resolved) return;
+            resolved = true;
+            chrome.runtime.onMessage.removeListener(handler);
+            clearTimeout(timeoutId);
+
+            const errObj = new Error(payload.data.error || "Followup failed");
+            errObj.unreachableType = payload.data.unreachableType || null;
+            reject(errObj);
+          }
+        }
+      };
+
+      const timeoutId = setTimeout(() => {
+        if (!resolved) {
+          resolved = true;
+          chrome.runtime.onMessage.removeListener(handler);
+          reject(new Error("Followup task timed out waiting for content script response"));
+        }
+      }, 300000);
+
+      chrome.runtime.onMessage.addListener(handler);
+
+      (async () => {
+        try {
+          const res = await sendTaskToContent("additional", "sendMessageFromDialog", payload, targetUrl);
+          if (!res?.success) {
+            if (!resolved) {
+              resolved = true;
+              chrome.runtime.onMessage.removeListener(handler);
+              clearTimeout(timeoutId);
+              reject(new Error(res?.error?.error || "Send message failed to start"));
+            }
+          }
+        } catch (err) {
+          if (!resolved) {
+            resolved = true;
+            chrome.runtime.onMessage.removeListener(handler);
+            clearTimeout(timeoutId);
+            reject(err);
+          }
+        }
+      })();
+    });
+  } 
+  else if (task.task_type === 'scrape_followers' || task.task_type === 'scrape_following') {
+    return new Promise((resolve, reject) => {
+      let resolved = false;
+
+      const handler = (message, sender) => {
+        if (sender.tab?.id !== state.additionalTabId) return;
+        if (message.type === "adblock:info:to-background" && message.isEmit) {
+          const payload = message.data;
+          if (payload.type === "successTask" && payload.data.taskId === task.id) {
+            if (resolved) return;
+            resolved = true;
+            chrome.runtime.onMessage.removeListener(handler);
+            clearTimeout(timeoutId);
+
+            (async () => {
+              try {
+                const targets = payload.data.targets;
+                if (targets && targets.length > 0) {
+                  const params = JSON.parse(task.message_text);
+                  const typeStr = task.task_type === 'scrape_followers' ? "followers" : "following";
+
+                  const listRes = await supabaseReq(`target_lists`, "POST", {
+                    user_id: task.user_id,
+                    name: `Scraped: ${params.target} (${typeStr})`,
+                    type: "raw",
+                    count: targets.length
+                  });
+
+                  if (listRes && listRes.length > 0) {
+                    const listId = listRes[0].id;
+
+                    let contactIds = [];
+                    for (let i = 0; i < targets.length; i += 1000) {
+                      const chunk = targets.slice(i, i + 1000);
+                      const contactsToInsert = chunk.map(t => ({
+                        user_id: task.user_id,
+                        username: t.username,
+                        full_name: t.fullName || t.username,
+                        profile_link: `https://instagram.com/${t.username}`,
+                        status: 'not_started'
+                      }));
+
+                      const cRes = await supabaseReq(`contacts?select=id`, "POST", contactsToInsert);
+                      if (cRes) contactIds = contactIds.concat(cRes.map(c => c.id));
+                    }
+
+                    for (let i = 0; i < contactIds.length; i += 1000) {
+                      const chunk = contactIds.slice(i, i + 1000);
+                      const links = chunk.map(cId => ({
+                        target_list_id: listId,
+                        contact_id: cId
+                      }));
+                      await supabaseReq(`target_list_items`, "POST", links);
+                    }
+                  }
+                }
+                resolve(true);
+              } catch (err) {
+                reject(err);
+              }
+            })();
+          } else if (payload.type === "errorTask" && payload.data.taskId === task.id) {
+            if (resolved) return;
+            resolved = true;
+            chrome.runtime.onMessage.removeListener(handler);
+            clearTimeout(timeoutId);
             reject(new Error(payload.data.error || "Scraping failed"));
           }
         }
       };
-      
-      chrome.runtime.onMessage.addListener(handler);
 
-      try {
-        const params = JSON.parse(task.message_text);
-        const res = await sendTaskToContent("additional", "parsing", {
-          taskId: task.id,
-          username: params.target,
-          type: task.task_type === 'scrape_followers' ? "followers" : "following",
-          limit: params.limit
-        });
-        
-        if (!res?.success) {
-           if (!resolved) {
-             resolved = true;
-             chrome.runtime.onMessage.removeListener(handler);
-             reject(new Error(res?.error?.error || "Failed to start scrape"));
-           }
-        }
-      } catch (err) {
+      const timeoutId = setTimeout(() => {
         if (!resolved) {
           resolved = true;
           chrome.runtime.onMessage.removeListener(handler);
-          reject(err);
+          reject(new Error("Scrape task timed out waiting for content script response"));
         }
-      }
+      }, 300000);
+
+      chrome.runtime.onMessage.addListener(handler);
+
+      (async () => {
+        try {
+          const params = JSON.parse(task.message_text);
+          const res = await sendTaskToContent("additional", "parsing", {
+            taskId: task.id,
+            username: params.target,
+            type: task.task_type === 'scrape_followers' ? "followers" : "following",
+            limit: params.limit
+          });
+
+          if (!res?.success) {
+             if (!resolved) {
+               resolved = true;
+               chrome.runtime.onMessage.removeListener(handler);
+               clearTimeout(timeoutId);
+               reject(new Error(res?.error?.error || "Failed to start scrape"));
+             }
+          }
+        } catch (err) {
+          if (!resolved) {
+            resolved = true;
+            chrome.runtime.onMessage.removeListener(handler);
+            clearTimeout(timeoutId);
+            reject(err);
+          }
+        }
+      })();
     });
   }
   else {
@@ -628,7 +933,7 @@ function randUrl() {
   return urls[Math.floor(Math.random() * urls.length)];
 }
 
-async function openTab(type) {
+async function openTab(type, targetUrl = null) {
   const stateKey = type === 'main' ? 'mainTabId' : 'additionalTabId';
   
   if (state[stateKey]) {
@@ -636,6 +941,17 @@ async function openTab(type) {
       const tab = await chrome.tabs.get(state[stateKey]);
       if (tab && !tab.discarded) {
         debugLog(`Reusing existing ${type} tab ${state[stateKey]}`);
+        if (targetUrl && tab.url !== targetUrl) {
+          debugLog(`Navigating ${type} tab to target URL: ${targetUrl}`);
+          await chrome.tabs.update(tab.id, { url: targetUrl });
+          for (let i = 0; i < 25; i++) {
+            try {
+              const t = await chrome.tabs.get(tab.id);
+              if (t.status === "complete") break;
+            } catch(e) { break; }
+            await sleep(400);
+          }
+        }
         return state[stateKey];
       }
     } catch (e) {
@@ -646,7 +962,7 @@ async function openTab(type) {
   debugLog(`Opening pinned Instagram ${type} tab...`);
 
   const tab = await chrome.tabs.create({
-    url: randUrl(),
+    url: targetUrl || randUrl(),
     active: false,
     index: 0,
     pinned: true
@@ -688,32 +1004,17 @@ function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
 
-async function sendTaskToContent(tabType, taskType, taskData) {
-  const tabId = await openTab(tabType);
+async function sendTaskToContent(tabType, taskType, taskData, targetUrl = null) {
+  const tabId = await openTab(tabType, targetUrl);
 
   debugLog(`Sending '${taskType}' to tab ${tabId}`);
 
   // Ping first to confirm content script is alive
   let pingOk = false;
-  for (let i = 0; i < 5; i++) {
-    try {
-      await chrome.tabs.sendMessage(tabId, {
-        type: "adblock:info:to-content",
-        data: { type: "ping", data: {} }
-      });
-      pingOk = true;
-      break;
-    } catch(e) {
-      await sleep(2000);
-    }
-  }
+  let reloadCount = 0;
 
-  if (!pingOk) {
-    debugLog("Content script not responding, reloading tab...");
-    await chrome.tabs.reload(tabId);
-    await sleep(8000);
-    // Re-ping after reload to confirm content script is alive
-    for (let i = 0; i < 10; i++) {
+  while (!pingOk && reloadCount < 2) {
+    for (let i = 0; i < 5; i++) {
       try {
         await chrome.tabs.sendMessage(tabId, {
           type: "adblock:info:to-content",
@@ -725,9 +1026,19 @@ async function sendTaskToContent(tabType, taskType, taskData) {
         await sleep(2000);
       }
     }
+
     if (!pingOk) {
-      throw new Error("Content script still not responding after tab reload");
+      reloadCount++;
+      debugLog(`Content script not responding. Reloading tab (attempt ${reloadCount}/2)...`);
+      await chrome.tabs.reload(tabId, { bypassCache: true });
+      await sleep(8000); // Wait for load
     }
+  }
+
+  if (!pingOk) {
+    const errObj = new Error("Content script still not responding after tab reloads");
+    errObj.unreachableType = "instagram_reload_error";
+    throw errObj;
   }
 
   debugLog(`[sendTaskToContent] Sending actual task ${taskType} to tab ${tabId}...`);
@@ -741,6 +1052,34 @@ async function sendTaskToContent(tabType, taskType, taskData) {
   } catch (err) {
     debugLog(`[sendTaskToContent] ERROR sending task ${taskType} to tab ${tabId}: ${err.message}`);
     throw err;
+  }
+}
+
+async function sendToContentLite(tabType, taskType, taskData) {
+  if (!state[tabType === 'main' ? 'mainTabId' : 'additionalTabId']) return null;
+  const tabId = state[tabType === 'main' ? 'mainTabId' : 'additionalTabId'];
+
+  try {
+    const pingRes = await Promise.race([
+      chrome.tabs.sendMessage(tabId, {
+        type: "adblock:info:to-content",
+        data: { type: "ping", data: {} }
+      }),
+      sleep(3000).then(() => null)
+    ]);
+    if (!pingRes) {
+      debugLog(`[sendToContentLite] Content script busy, skipping ${taskType}`);
+      return null;
+    }
+
+    const response = await chrome.tabs.sendMessage(tabId, {
+      type: "adblock:info:to-content",
+      data: { type: taskType, data: taskData }
+    });
+    return response;
+  } catch (e) {
+    debugLog(`[sendToContentLite] ${taskType} skipped: ${e.message}`);
+    return null;
   }
 }
 
@@ -765,6 +1104,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
   if (message.type === "HUB_DISCONNECT") {
     stopEngine();
+    chrome.alarms.clear("engine_heartbeat");
     closeTabs();
     state.browserId = null;
     state.browserLabel = null;
@@ -786,12 +1126,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
   if (message.type === "HUB_PAUSE_ENGINE") {
     debugLog("[Engine] Paused by user.");
+    stopEngine();
     closeTabs();
     sendResponse({ ok: true });
     return;
   }
   if (message.type === "HUB_RESUME_ENGINE") {
     debugLog("[Engine] Resumed by user. Opening tab eagerly.");
+    chrome.storage.local.remove('wakeUpAt').catch(()=>null);
     startEngine();
     openTab('main').catch(err => debugLog(`Open tab error: ${err.message}`));
     sendResponse({ ok: true });
@@ -865,6 +1207,19 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       // already handled by the Promise listener in executeTask
       sendResponse({ success: true });
       return;
+    }
+
+    // saveMessages: content script sends read receipts for processing
+    if (taskType === "saveMessages") {
+      (async () => {
+        try {
+          await processCollectedMessages(taskData?.readReceipts || []);
+          sendResponse({ success: true, result: true });
+        } catch (err) {
+          sendResponse({ success: false, error: err.message });
+        }
+      })();
+      return true;
     }
 
     // Default passthrough

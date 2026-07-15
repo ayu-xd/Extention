@@ -53,22 +53,33 @@ class ImageStorage {
     
     if (exactResult) return exactResult;
     
-    // Fallback: scan all keys for a fuzzy match (handles extension mismatches like "user.sol" vs "user")
+    // Clean target username (remove leading @, dots, dashes, underscores)
+    const cleanTarget = normalizedUsername.replace(/^@/, '').replace(/[\._-]/g, '');
+
+    // Fallback scan: matches extension-mismatches, dots vs dashes (e.g. "rok.petrina" vs "rok-petrina.png")
     return new Promise((resolve, reject) => {
       const transaction = db.transaction(STORE_NAME, "readonly");
       const store = transaction.objectStore(STORE_NAME);
       const request = store.openCursor();
       let found = null;
-      console.log(`[ImageStorage] Fallback scan started for: "${normalizedUsername}"`);
+      console.log(`[ImageStorage] Fallback scan started for: "${normalizedUsername}" (cleanTarget: "${cleanTarget}")`);
       request.onsuccess = (event) => {
         const cursor = event.target.result;
         if (cursor) {
-          const key = cursor.value.username;
-          console.log(`[ImageStorage] Comparing with DB key: "${key}"`);
-          // Match if stored key starts with our username (e.g. "memeflipper.sol" starts with "memeflipper")
-          // or if our username starts with stored key (e.g. looking up "memeflipper.sol" matches stored "memeflipper")
-          if (key.startsWith(normalizedUsername) || normalizedUsername.startsWith(key)) {
-            console.log(`[ImageStorage] Fuzzy match SUCCESS: "${key}" matches "${normalizedUsername}"`);
+          const rawKey = cursor.value.username;
+          // Strip image extensions (.png, .jpg, etc) and punctuation (., -, _) from stored key
+          const cleanKey = rawKey.replace(/\.(png|jpg|jpeg|webp)$/i, '').replace(/^@/, '').replace(/[\._-]/g, '');
+
+          console.log(`[ImageStorage] Comparing stored key "${rawKey}" (clean: "${cleanKey}") with target "${normalizedUsername}" (clean: "${cleanTarget}")`);
+          
+          if (
+            cleanKey === cleanTarget ||
+            rawKey.startsWith(normalizedUsername) ||
+            normalizedUsername.startsWith(rawKey) ||
+            cleanKey.startsWith(cleanTarget) ||
+            cleanTarget.startsWith(cleanKey)
+          ) {
+            console.log(`[ImageStorage] Fuzzy match SUCCESS: "${rawKey}" matches "${normalizedUsername}"`);
             found = cursor.value.blob;
             resolve(found);
             return;

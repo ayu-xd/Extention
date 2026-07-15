@@ -1725,19 +1725,29 @@
         for (const u in h) h[u].messages.sort((e, t) => Number(t.timestampMs) - Number(e.timestampMs));
         for (const p of (await this._getDatabase("threads")).map((e) =>
           this._formatData({ data: e, bs_caml_int64: t }),
-        ))
-          Object.values(h).find((e) => e.thread_key === p.threadKey) ||
-            ((m = i[p.threadKey] ?? l[p.threadKey]),
-            (d = a[p.threadKey] ?? c[p.threadKey]),
-            m &&
-              d &&
-              (h[m.secondaryName] = {
+        )) {
+          var existing = Object.values(h).find((e) => e.thread_key === p.threadKey);
+          if (existing) {
+            existing.lastSeenAt = p.lastSeenAt ?? p.last_seen_at ?? null;
+            existing.lastActivityAt = p.lastActivityAt ?? p.last_activity_at ?? null;
+            existing.seenState = p.seenState ?? p.seen_state ?? null;
+          } else {
+            m = i[p.threadKey] ?? l[p.threadKey];
+            d = a[p.threadKey] ?? c[p.threadKey];
+            if (m && d) {
+              h[m.secondaryName] = {
                 username: m?.secondaryName,
                 instagram_id: d?.igId,
                 contact_reachability_status_type: m?.contactReachabilityStatusType,
                 thread_key: p.threadKey,
+                lastSeenAt: p.lastSeenAt ?? p.last_seen_at ?? null,
+                lastActivityAt: p.lastActivityAt ?? p.last_activity_at ?? null,
+                seenState: p.seenState ?? p.seen_state ?? null,
                 messages: [],
-              }));
+              };
+            }
+          }
+        }
         return h;
       }
       _getAllMessagesFromDOM() {
