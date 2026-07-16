@@ -324,6 +324,7 @@ async function processCollectedMessages(readReceipts) {
     if (!Array.isArray(readReceipts) || readReceipts.length === 0) return;
 
     const seenUsernames = new Set();
+    const repliedUsernames = new Set();
     let seenCount = 0;
     let replyCount = 0;
 
@@ -333,7 +334,10 @@ async function processCollectedMessages(readReceipts) {
       if (entry.hasSeen || entry.hasReply) {
         seenUsernames.add(entry.username.toLowerCase());
         if (entry.hasSeen) seenCount++;
-        if (entry.hasReply) replyCount++;
+        if (entry.hasReply) {
+          replyCount++;
+          repliedUsernames.add(entry.username.toLowerCase());
+        }
       }
     }
 
@@ -351,8 +355,43 @@ async function processCollectedMessages(readReceipts) {
         );
       }
     }
+
+    // Leads who replied: proactively cancel their remaining follow-ups so we never
+    // DM someone who already responded — the belt-and-suspenders behind the send-time guard.
+    if (repliedUsernames.size > 0) {
+      const repliedList = Array.from(repliedUsernames);
+      for (let i = 0; i < repliedList.length; i += 50) {
+        const chunk = repliedList.slice(i, i + 50);
+        const inQuery = chunk.map(u => `"${u}"`).join(",");
+        const contacts = await supabaseReq(`contacts?select=id&username=in.(${inQuery})`);
+        for (const contact of (contacts || [])) {
+          await cancelPendingFollowups(contact.id, "lead_replied");
+        }
+      }
+    }
   } catch (err) {
     debugLog(`[Collector] Error processing collected messages: ${err.message}`);
+  }
+}
+
+// Cancel any still-pending follow-up tasks for a contact (e.g. after they replied).
+// Only touches 'pending' rows — an in-flight 'processing' task is left alone.
+async function cancelPendingFollowups(contactId, reason) {
+  if (!contactId) return 0;
+  try {
+    const cancelled = await supabaseReq(
+      `dm_tasks?contact_id=eq.${contactId}&status=eq.pending&task_type=like.followup_*`,
+      "PATCH",
+      { status: "failed", error_reason: reason }
+    );
+    const count = Array.isArray(cancelled) ? cancelled.length : 0;
+    if (count > 0) {
+      debugLog(`[Collector] Cancelled ${count} pending follow-up(s) for contact ${contactId} (${reason}).`);
+    }
+    return count;
+  } catch (err) {
+    debugLog(`[Collector] Error cancelling follow-ups for contact ${contactId}: ${err.message}`);
+    return 0;
   }
 }
 
@@ -663,6 +702,14 @@ async function executeTask(task) {
                     is_limited: !!data.isLimited
                   });
                 }
+                if (data.response === true && task.contact_id) {
+                  debugLog(`[Guard] Lead replied — skipping send for task ${task.id}, cancelling remaining follow-ups.`);
+                  await cancelPendingFollowups(task.contact_id, "lead_replied");
+                  await supabaseReq(`contacts?id=eq.${task.contact_id}`, "PATCH", {
+                    media_seen: true,
+                    media_seen_at: new Date().toISOString()
+                  });
+                }
                 resolve({ isLimited: !!data.isLimited });
               } catch (err) {
                 resolve({ isLimited: !!data.isLimited });
@@ -731,7 +778,7 @@ async function executeTask(task) {
       message: { text: task.message_text },
       taskId: task.id,
       usePreresolvedNames: true,
-      skipMessageExistsCheck: true
+      skipMessageExistsCheck: false
     };
 
     return new Promise((resolve, reject) => {
@@ -756,6 +803,14 @@ async function executeTask(task) {
                     last_message_id: data.lastMessageId || null,
                     last_message_ts: data.lastMessageTimestamp || new Date().toISOString(),
                     is_limited: !!data.isLimited
+                  });
+                }
+                if (data.response === true && task.contact_id) {
+                  debugLog(`[Guard] Lead replied — skipping send for task ${task.id}, cancelling remaining follow-ups.`);
+                  await cancelPendingFollowups(task.contact_id, "lead_replied");
+                  await supabaseReq(`contacts?id=eq.${task.contact_id}`, "PATCH", {
+                    media_seen: true,
+                    media_seen_at: new Date().toISOString()
                   });
                 }
                 resolve({ isLimited: !!data.isLimited });
