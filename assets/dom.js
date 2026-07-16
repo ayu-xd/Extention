@@ -597,8 +597,16 @@ class ADBlockDOM {
         cancelable: !0
       }),
       e = (e.cancelBubble = !1, e.returnValue = !0, e.key = "Enter", e.keyCode = 13, e.which = 13, e.charCode = 13, e.shiftKey = !1, e.ctrlKey = !1, e.metaKey = !1, new window.KeyboardEvent("keydown", e)),
-      t = document.querySelector('div[contenteditable="true"]'),
-      s = await this._importNamespace("Lexical");
+      t = document.querySelector('div[contenteditable="true"]');
+    // Wait for the composer to be mounted & ready before pressing Enter.
+    // On slow connections it can be null mid-transition (e.g. while an image preview
+    // is still uploading), which used to throw and drop the message/image.
+    for (var _start = Date.now(); (!t || !t.__lexicalEditor) && Date.now() - _start < 15e3;) {
+      await new Promise((r) => setTimeout(r, 150));
+      t = document.querySelector('div[contenteditable="true"]');
+    }
+    if (!t || !t.__lexicalEditor) throw new Error("Composer not ready");
+    var s = await this._importNamespace("Lexical");
     t.__lexicalEditor.dispatchCommand(s.KEY_ENTER_COMMAND, e)
   }
   async _sendImage({ buffer, type }) {
