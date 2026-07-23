@@ -2,7 +2,7 @@
 	"manifest_version": 3,
 	"name": "DMDroid",
 	"short_name": "DMDroid",
-	"version": "1.0.0",
+	"version": "1.2",
 	"description": "DMDroid extension",
 	"icons": {
 		"16": "icons/icon-16x16.png",
