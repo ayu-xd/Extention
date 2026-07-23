@@ -13,7 +13,8 @@ let state = {
   processingLockAcquiredAt: 0,
   mainTabId: null,
   additionalTabId: null,
-  lastTaskCompletedAt: 0
+  lastTaskCompletedAt: 0,
+  emptyPollCount: 0
 };
 
 async function persistDebugLog(msg) {
@@ -130,10 +131,13 @@ async function init() {
   if (data.mainTabId) state.mainTabId = data.mainTabId;
   if (data.additionalTabId) state.additionalTabId = data.additionalTabId;
 
-  // Heartbeat runs 24/7 — even when paused — so the web app knows the browser is online
+  // Heartbeat runs 24/7 — even when paused — so the web app knows the browser is online.
+  // Clear any stale leaseExpiresAt so the first write after restart always goes through,
+  // preventing browsers from showing Offline after a reload or DB migration.
   if (state.browserId) {
     chrome.alarms.create("engine_heartbeat", { periodInMinutes: 1 });
-    sendHeartbeat().catch(()=>{});
+    await chrome.storage.local.remove('leaseExpiresAt');
+    sendHeartbeat(true).catch(()=>{});
   }
 
   if (data.enginePaused) {
@@ -242,6 +246,9 @@ async function handleConnect(browserId, browserLabel) {
     await syncStatsFromDatabase();
 
     startEngine();
+    await chrome.storage.local.remove('leaseExpiresAt');
+    await chrome.storage.local.remove('campaignSettingsCache');
+    sendHeartbeat(true).catch(()=>{});
     chrome.runtime.sendMessage({ type: "HUB_CONNECTED_SUCCESS", label: state.browserLabel, stats: state.stats }).catch(()=>null);
   } catch (err) {
     debugLog(`Connect error: ${err.message}`);
@@ -395,14 +402,72 @@ async function cancelPendingFollowups(contactId, reason) {
   }
 }
 
-async function sendHeartbeat() {
+// ---------------------------------------------------------------------------
+// Working Hours Helpers
+// ---------------------------------------------------------------------------
+
+async function getActiveCampaignSettings() {
+  const cached = await chrome.storage.local.get('campaignSettingsCache');
+  if (cached.campaignSettingsCache) {
+    const { data, timezone, fetchedAt } = cached.campaignSettingsCache;
+    if (Date.now() - fetchedAt < 30 * 60 * 1000) return { data, timezone };
+  }
+  const userId = getUserIdFromToken(state.accessToken);
+  const [campaigns, userSettings] = await Promise.all([
+    supabaseReq(`campaigns?select=id,working_hours_enabled,work_start_hour,work_end_hour&status=neq.archived`),
+    userId ? supabaseReq(`user_settings?select=timezone&user_id=eq.${userId}`) : Promise.resolve([])
+  ]);
+  const data = campaigns ?? [];
+  const timezone = userSettings?.[0]?.timezone || 'UTC';
+  await chrome.storage.local.set({ campaignSettingsCache: { data, timezone, fetchedAt: Date.now() } });
+  return { data, timezone };
+}
+
+function isInWorkingHours(campaign, timezone) {
+  if (!campaign.working_hours_enabled) return true;
+  const start = campaign.work_start_hour ?? 0;
+  const end = campaign.work_end_hour ?? 24;
+  const nowHour = parseInt(
+    new Intl.DateTimeFormat('en-US', { hour: 'numeric', hour12: false, timeZone: timezone }).format(new Date()),
+    10
+  );
+  if (start < end) return nowHour >= start && nowHour < end;
+  return nowHour >= start || nowHour < end;
+}
+
+function minsUntilWindowOpens(campaign, timezone) {
+  const start = campaign.work_start_hour ?? 0;
+  const nowHour = parseInt(
+    new Intl.DateTimeFormat('en-US', { hour: 'numeric', hour12: false, timeZone: timezone }).format(new Date()),
+    10
+  );
+  const nowMin = new Date().getMinutes();
+  if (nowHour < start) return (start - nowHour) * 60 - nowMin;
+  return (24 - nowHour + start) * 60 - nowMin;
+}
+
+async function sendHeartbeat(force = false) {
   if (!state.browserId) return;
   try {
+    const stored = await chrome.storage.local.get('leaseExpiresAt');
+    const leaseExpiresAt = stored.leaseExpiresAt || 0;
+
+    // Only write to DB when lease expires within 2 minutes (or not set yet).
+    // This cuts heartbeat writes from every 1 min to every ~8-9 min.
+    // force=true bypasses the check — used on startup and new connections.
+    if (!force && leaseExpiresAt > Date.now() + 120_000) {
+      debugLog(`Heartbeat skipped — lease valid for ${Math.round((leaseExpiresAt - Date.now()) / 1000)}s`);
+      return;
+    }
+
+    const newExpiresAt = Date.now() + 600_000; // 10-minute lease
     await supabaseReq(`browser_instances?id=eq.${state.browserId}`, "PATCH", {
       last_heartbeat_at: new Date().toISOString(),
+      expires_at: new Date(newExpiresAt).toISOString(),
       status: 'active'
     });
-    debugLog(`Heartbeat sent! Status: active`);
+    await chrome.storage.local.set({ leaseExpiresAt: newExpiresAt });
+    debugLog(`Heartbeat sent! Lease renewed for 10 min.`);
   } catch (err) {
     console.error("Heartbeat failed:", err);
     debugLog(`Heartbeat Error: ${err.message}`);
@@ -477,16 +542,44 @@ async function pollTasks() {
       return;
     }
 
+    // Working hours gate — skip polling entirely if all campaigns are outside window
+    const campaignSettingsResult = await getActiveCampaignSettings();
+    const whTimezone = campaignSettingsResult.timezone;
+    const whCampaigns = campaignSettingsResult.data.filter(c => c.working_hours_enabled);
+    if (whCampaigns.length > 0) {
+      const anyOpen = whCampaigns.some(c => isInWorkingHours(c, whTimezone));
+      if (!anyOpen) {
+        const minWait = Math.min(...whCampaigns.map(c => minsUntilWindowOpens(c, whTimezone)));
+        const wakeMs = Date.now() + Math.max(minWait, 1) * 60 * 1000;
+        await chrome.storage.local.set({ wakeUpAt: wakeMs });
+        debugLog(`[Poll] All campaigns outside working hours. Sleeping ${minWait}m.`);
+        return;
+      }
+    }
+
     // 1. Fetch a pending task
-    const url = `dm_tasks?select=*,campaigns!inner(status)&browser_instance_id=eq.${state.browserId}&status=eq.pending&campaigns.status=eq.active&order=created_at.asc&limit=1`;
+    const url = `dm_tasks?select=*,campaigns!inner(status,working_hours_enabled,work_start_hour,work_end_hour)&browser_instance_id=eq.${state.browserId}&status=eq.pending&campaigns.status=eq.active&order=created_at.asc&limit=1`;
     const tasks = await supabaseReq(url);
 
     if (!tasks || tasks.length === 0) {
-      debugLog(`[Poll] 0 pending tasks found for browser ${state.browserId}.`);
+      const BACKOFF_MS = [15000, 30000, 60000, 120000, 300000];
+      const backoffMs = BACKOFF_MS[Math.min(state.emptyPollCount, BACKOFF_MS.length - 1)];
+      state.emptyPollCount++;
+      await chrome.storage.local.set({ wakeUpAt: Date.now() + backoffMs });
+      debugLog(`[Poll] 0 tasks. Backing off ${backoffMs / 1000}s (empty #${state.emptyPollCount}).`);
       return;
     }
 
     const task = tasks[0];
+    state.emptyPollCount = 0; // queue has work — reset backoff to 15s
+
+    // Per-task working hours check — skip if this task's campaign is outside its window
+    if (task.campaigns?.working_hours_enabled) {
+      if (!isInWorkingHours(task.campaigns, whTimezone)) {
+        debugLog(`[Poll] Task ${task.id} skipped — campaign outside working hours.`);
+        return;
+      }
+    }
     delete task.campaigns;
 
     if (task.contact_id) {
