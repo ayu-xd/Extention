@@ -794,6 +794,13 @@ async function executeTask(task) {
                     last_message_ts: data.lastMessageTimestamp || new Date().toISOString(),
                     is_limited: !!data.isLimited
                   });
+                  // Also write thread_id to contacts so the scheduler can
+                  // include it when generating followup_ task rows.
+                  if (task.contact_id) {
+                    await supabaseReq(`contacts?id=eq.${task.contact_id}`, "PATCH", {
+                      thread_id: data.threadId
+                    });
+                  }
                 }
                 if (data.response === true && task.contact_id) {
                   debugLog(`[Guard] Lead replied — skipping send for task ${task.id}, cancelling remaining follow-ups.`);
