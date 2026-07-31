@@ -97,6 +97,54 @@ async function supabaseReq(path, method = "GET", body = null, _retried = false) 
   return res.json();
 }
 
+// Upsert (POST ...?on_conflict=...) with merge-duplicates. Used for the new
+// per-account `contact_account_outreach` table so re-sending state for the same
+// (contact, browser) pair updates instead of erroring on the unique constraint.
+async function supabaseUpsert(path, body, onConflict, _retried = false) {
+  const headers = {
+    "apikey": SUPABASE_ANON_KEY,
+    "Authorization": `Bearer ${state.accessToken ? state.accessToken : SUPABASE_ANON_KEY}`,
+    "Content-Type": "application/json",
+    "Prefer": "resolution=merge-duplicates,return=representation"
+  };
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/${path}?on_conflict=${onConflict}`, {
+    method: "POST", headers, body: JSON.stringify(body)
+  });
+  if (res.status === 401 && !_retried && state.refreshToken) {
+    debugLog("Token expired, refreshing...");
+    const refreshed = await refreshAccessToken();
+    if (refreshed) return supabaseUpsert(path, body, onConflict, true);
+  }
+  if (!res.ok) {
+    throw new Error(`Supabase upsert error: ${res.status} ${res.statusText}`);
+  }
+  return res.json();
+}
+
+// Dual-write: mirror per-account outreach state into contact_account_outreach.
+// Non-fatal by design — the global `contacts` write is still the source of truth
+// in Phase 1, so a failure here must never break a send.
+async function caoUpsert(contactId, fields) {
+  try {
+    if (!contactId || !state.browserId) return;
+    const userId = getUserIdFromToken(state.accessToken);
+    if (!userId) return;
+    await supabaseUpsert(
+      "contact_account_outreach",
+      {
+        user_id: userId,
+        contact_id: contactId,
+        browser_instance_id: state.browserId,
+        updated_at: new Date().toISOString(),
+        ...fields
+      },
+      "contact_id,browser_instance_id"
+    );
+  } catch (err) {
+    debugLog(`[CAO] dual-write failed (non-fatal): ${err.message}`);
+  }
+}
+
 async function refreshAccessToken() {
   try {
     const res = await fetch(`${SUPABASE_URL}/auth/v1/token?grant_type=refresh_token`, {
@@ -360,6 +408,16 @@ async function processCollectedMessages(readReceipts) {
           "PATCH",
           { media_seen: true, media_seen_at: new Date().toISOString() }
         );
+        // Dual-write per-account seen state. The seen/reply came from THIS
+        // browser's logged-in IG account, so it belongs to (contact, thisBrowser).
+        try {
+          const seenContacts = await supabaseReq(`contacts?select=id&username=in.(${inQuery})`);
+          for (const c of (seenContacts || [])) {
+            await caoUpsert(c.id, { media_seen: true, media_seen_at: new Date().toISOString() });
+          }
+        } catch (e) {
+          debugLog(`[CAO] seen dual-write failed (non-fatal): ${e.message}`);
+        }
       }
     }
 
@@ -372,6 +430,14 @@ async function processCollectedMessages(readReceipts) {
         const inQuery = chunk.map(u => `"${u}"`).join(",");
         const contacts = await supabaseReq(`contacts?select=id&username=in.(${inQuery})`);
         for (const contact of (contacts || [])) {
+          // Persist the reply (global + per-account) so the scheduler stops
+          // generating ghost follow-ups for this lead. NOT media_seen — this is
+          // a genuine reply detected from the Relay store.
+          try {
+            await supabaseReq(`contacts?id=eq.${contact.id}`, "PATCH",
+              { replied: true, replied_at: new Date().toISOString() });
+          } catch (e) { debugLog(`[Replied] global persist failed (non-fatal): ${e.message}`); }
+          await caoUpsert(contact.id, { replied: true, replied_at: new Date().toISOString() });
           await cancelPendingFollowups(contact.id, "lead_replied");
         }
       }
@@ -383,13 +449,16 @@ async function processCollectedMessages(readReceipts) {
 
 // Cancel any still-pending follow-up tasks for a contact (e.g. after they replied).
 // Only touches 'pending' rows — an in-flight 'processing' task is left alone.
+// Cross-account fix: scoped by browser_instance_id so a reply received by THIS
+// account only cancels THIS account's follow-ups — never another account's.
 async function cancelPendingFollowups(contactId, reason) {
   if (!contactId) return 0;
   try {
+    const browserFilter = state.browserId ? `&browser_instance_id=eq.${state.browserId}` : "";
     const cancelled = await supabaseReq(
-      `dm_tasks?contact_id=eq.${contactId}&status=eq.pending&task_type=like.followup_*`,
+      `dm_tasks?contact_id=eq.${contactId}&status=eq.pending&task_type=like.followup_*${browserFilter}`,
       "PATCH",
-      { status: "failed", error_reason: reason }
+      { status: "skipped", error_reason: reason }
     );
     const count = Array.isArray(cancelled) ? cancelled.length : 0;
     if (count > 0) {
@@ -602,30 +671,55 @@ async function pollTasks() {
         await chrome.storage.local.set({ enginePaused: true });
       }
 
-      await supabaseReq(`dm_tasks?id=eq.${task.id}`, "PATCH", {
-        status: "completed",
-        completed_at: new Date().toISOString()
-      });
+      if (result?.skippedReply) {
+        // Reply-skip: the lead already replied, so nothing was sent. Record it
+        // honestly — task = skipped (NOT completed), do NOT advance the follow-up
+        // chain, do NOT charge quota, do NOT pacing-sleep. `replied` was already
+        // persisted (global + per-account) inside executeTask.
+        await supabaseReq(`dm_tasks?id=eq.${task.id}`, "PATCH", {
+          status: "skipped",
+          error_reason: "lead_replied"
+        });
+        state.stats.failed++;
+        debugLog(`Task Skipped (lead replied): ${task.task_type}`);
+      } else {
+        await supabaseReq(`dm_tasks?id=eq.${task.id}`, "PATCH", {
+          status: "completed",
+          completed_at: new Date().toISOString()
+        });
 
-      if (task.contact_id && task.task_type === 'first_dm') {
-        await supabaseReq(`contacts?id=eq.${task.contact_id}`, "PATCH", {
-          status: "dmed",
-          dmed_at: new Date().toISOString(),
-          assigned_browser_id: state.browserId
-        });
-      } else if (task.contact_id && task.task_type.startsWith('followup_')) {
-        const stepLetter = task.task_type.replace('followup_1', '').toUpperCase() || 'A';
-        await supabaseReq(`contacts?id=eq.${task.contact_id}`, "PATCH", {
-          followup_1a_sent: true,
-          current_follow_up: `1${stepLetter}`,
-          last_follow_up_at: new Date().toISOString()
-        });
+        if (task.contact_id && task.task_type === 'first_dm') {
+          await supabaseReq(`contacts?id=eq.${task.contact_id}`, "PATCH", {
+            status: "dmed",
+            dmed_at: new Date().toISOString(),
+            assigned_browser_id: state.browserId
+          });
+          // Dual-write per-account outreach (Phase 1)
+          await caoUpsert(task.contact_id, {
+            status: "dmed",
+            dmed_at: new Date().toISOString(),
+            campaign_id: task.campaign_id || null
+          });
+        } else if (task.contact_id && task.task_type.startsWith('followup_')) {
+          const stepLetter = task.task_type.replace('followup_1', '').toUpperCase() || 'A';
+          await supabaseReq(`contacts?id=eq.${task.contact_id}`, "PATCH", {
+            followup_1a_sent: true,
+            current_follow_up: `1${stepLetter}`,
+            last_follow_up_at: new Date().toISOString()
+          });
+          // Dual-write per-account outreach (Phase 1)
+          await caoUpsert(task.contact_id, {
+            followup_1a_sent: true,
+            current_follow_up: `1${stepLetter}`,
+            last_follow_up_at: new Date().toISOString()
+          });
+        }
+
+        state.stats.completed++;
+        state.lastTaskCompletedAt = Date.now();
+        taskSucceeded = true;
+        debugLog(`Task Completed: ${task.task_type}`);
       }
-
-      state.stats.completed++;
-      state.lastTaskCompletedAt = Date.now();
-      taskSucceeded = true;
-      debugLog(`Task Completed: ${task.task_type}`);
     } catch (err) {
       console.error("Task failed:", err);
       const isThreadBusy = err.message?.includes("thread is busy");
@@ -796,10 +890,27 @@ async function executeTask(task) {
                   });
                   // Also write thread_id to contacts so the scheduler can
                   // include it when generating followup_ task rows.
+                  // Phase 1 cross-account: only set the GLOBAL thread_id if it is
+                  // currently NULL (i.e. this is the first-ever account to DM the
+                  // lead). A 2nd account's thread must NOT overwrite it — that
+                  // would point account A's pending follow-ups at account B's thread.
                   if (task.contact_id) {
-                    await supabaseReq(`contacts?id=eq.${task.contact_id}`, "PATCH", {
-                      thread_id: data.threadId
-                    });
+                    try {
+                      const existing = await supabaseReq(`contacts?select=thread_id&id=eq.${task.contact_id}`);
+                      const currentThreadId = existing && existing[0] ? existing[0].thread_id : null;
+                      if (!currentThreadId) {
+                        await supabaseReq(`contacts?id=eq.${task.contact_id}`, "PATCH", {
+                          thread_id: data.threadId
+                        });
+                      }
+                    } catch (e) {
+                      // Fallback: preserve old behavior if the read fails.
+                      await supabaseReq(`contacts?id=eq.${task.contact_id}`, "PATCH", {
+                        thread_id: data.threadId
+                      });
+                    }
+                    // Dual-write per-account thread (always this account's own thread).
+                    await caoUpsert(task.contact_id, { assigned_thread_id: data.threadId });
                   }
                 }
                 if (data.response === true && task.contact_id) {
@@ -807,8 +918,21 @@ async function executeTask(task) {
                   await cancelPendingFollowups(task.contact_id, "lead_replied");
                   await supabaseReq(`contacts?id=eq.${task.contact_id}`, "PATCH", {
                     media_seen: true,
-                    media_seen_at: new Date().toISOString()
+                    media_seen_at: new Date().toISOString(),
+                    replied: true,
+                    replied_at: new Date().toISOString()
                   });
+                  // Dual-write per-account seen + replied state
+                  await caoUpsert(task.contact_id, {
+                    media_seen: true,
+                    media_seen_at: new Date().toISOString(),
+                    replied: true,
+                    replied_at: new Date().toISOString()
+                  });
+                  // Signal pollTasks: nothing was sent (reply skip) — don't charge quota,
+                  // don't advance the chain, mark the task skipped not completed.
+                  resolve({ isLimited: !!data.isLimited, skippedReply: true });
+                  return;
                 }
                 resolve({ isLimited: !!data.isLimited });
               } catch (err) {
@@ -904,14 +1028,31 @@ async function executeTask(task) {
                     last_message_ts: data.lastMessageTimestamp || new Date().toISOString(),
                     is_limited: !!data.isLimited
                   });
+                  // Dual-write per-account thread (this account's own thread)
+                  if (task.contact_id) {
+                    await caoUpsert(task.contact_id, { assigned_thread_id: data.threadId });
+                  }
                 }
                 if (data.response === true && task.contact_id) {
                   debugLog(`[Guard] Lead replied — skipping send for task ${task.id}, cancelling remaining follow-ups.`);
                   await cancelPendingFollowups(task.contact_id, "lead_replied");
                   await supabaseReq(`contacts?id=eq.${task.contact_id}`, "PATCH", {
                     media_seen: true,
-                    media_seen_at: new Date().toISOString()
+                    media_seen_at: new Date().toISOString(),
+                    replied: true,
+                    replied_at: new Date().toISOString()
                   });
+                  // Dual-write per-account seen + replied state
+                  await caoUpsert(task.contact_id, {
+                    media_seen: true,
+                    media_seen_at: new Date().toISOString(),
+                    replied: true,
+                    replied_at: new Date().toISOString()
+                  });
+                  // Signal pollTasks: nothing was sent (reply skip) — don't charge quota,
+                  // don't advance the chain, mark the task skipped not completed.
+                  resolve({ isLimited: !!data.isLimited, skippedReply: true });
+                  return;
                 }
                 resolve({ isLimited: !!data.isLimited });
               } catch (err) {
