@@ -918,14 +918,32 @@ class Instagram {
         try {
           if (this.isBusy = !0, this.taskId = s, this._checkIfUserReceivedBlockMessage(), await this.domConnector.send("preTaskHooks", {}), await this.sleep(5e3), await this._checkIfOpenUserRequired({
               username: e.username
-            })) this.backgroundConnector.emit("errorTask", {
-            error: "Dialog is not opened in additional tab",
-            errorType: "additional_tab_error",
-            taskId: s,
-            taskType: "sendMessage",
-            additionalTab: !0
-          });
-          else {
+            })) {
+            // Self-recover: instead of erroring, open the thread live by username
+            // (same as the first-DM path). The background no longer pre-navigates
+            // to a stored thread_id URL, so the tab sits on the DM inbox and we
+            // open the correct thread here. Only error if it still won't open.
+            this.log({ type: "[Followup] Thread not open — opening by username", data: { username: e.username } });
+            try {
+              await this._openDirectIfNeeded();
+              await this.sleep(5e3);
+              await this.domConnector.send("openUser", { username: e.username });
+              await this.sleep(5e3);
+            } catch (openErr) {
+              this.log({ type: "[Followup] openUser failed", data: { error: openErr?.toString?.() } });
+            }
+            if (await this._checkIfOpenUserRequired({ username: e.username })) {
+              this.backgroundConnector.emit("errorTask", {
+                error: "Dialog is not opened in additional tab",
+                errorType: "additional_tab_error",
+                taskId: s,
+                taskType: "sendMessage",
+                additionalTab: !0
+              });
+              return;
+            }
+          }
+          {
             var n = {
                 0: "REACHABLE",
                 1: "UNREACHABLE_USER_TYPE",

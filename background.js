@@ -991,11 +991,16 @@ async function executeTask(task) {
     const targetUsername = task.contacts?.username;
     if (!targetUsername) throw new Error("Missing target username in contact relation");
 
-    let targetUrl = null;
-    if (task.thread_id) {
-      targetUrl = `https://www.instagram.com/direct/t/${task.thread_id}/`;
-      debugLog(`[Followup] Using direct thread URL for ${targetUsername}: ${targetUrl}`);
-    }
+    // Route follow-ups by USERNAME, not the stored thread_id. The stored
+    // thread_id is a URL numeric id captured in a previous session; Instagram's
+    // open-check (_checkIfOpenUserRequired) compares it against the live React
+    // store's thread_key, and the two schemes don't always match — causing a
+    // false "Dialog is not opened" failure even with the thread open.
+    // ColdDMs never persists thread_id; it re-derives the thread live. So we
+    // open a neutral page and let the content script open the thread by username.
+    // thread_id / assigned_thread_id remain stored for observability only.
+    const targetUrl = null;
+    debugLog(`[Followup] Routing by username (live thread resolution) for ${targetUsername}`);
 
     const payload = {
       target: { username: targetUsername },
@@ -1231,15 +1236,19 @@ function randUrl() {
 
 async function openTab(type, targetUrl = null) {
   const stateKey = type === 'main' ? 'mainTabId' : 'additionalTabId';
-  
+
   if (state[stateKey]) {
     try {
       const tab = await chrome.tabs.get(state[stateKey]);
       if (tab && !tab.discarded) {
+        // For the additional tab with no explicit target, force-navigate to the DM
+        // inbox so we never reuse a stale thread page from a previous task. The
+        // content script then opens the correct thread live by username.
+        const effectiveUrl = targetUrl || (type === 'additional' ? "https://www.instagram.com/direct/inbox/" : null);
         debugLog(`Reusing existing ${type} tab ${state[stateKey]}`);
-        if (targetUrl && tab.url !== targetUrl) {
-          debugLog(`Navigating ${type} tab to target URL: ${targetUrl}`);
-          await chrome.tabs.update(tab.id, { url: targetUrl });
+        if (effectiveUrl && tab.url !== effectiveUrl) {
+          debugLog(`Navigating ${type} tab to target URL: ${effectiveUrl}`);
+          await chrome.tabs.update(tab.id, { url: effectiveUrl });
           for (let i = 0; i < 25; i++) {
             try {
               const t = await chrome.tabs.get(tab.id);
