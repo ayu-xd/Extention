@@ -987,29 +987,35 @@ async function executeTask(task) {
     const targetUsername = task.contacts?.username;
     if (!targetUsername) throw new Error("Missing target username in contact relation");
 
-    // Route follow-ups by USERNAME, not the stored thread_id. The stored
-    // thread_id is a URL numeric id captured in a previous session; Instagram's
-    // open-check (_checkIfOpenUserRequired) compares it against the live React
-    // store's thread_key, and the two schemes don't always match — causing a
-    // false "Dialog is not opened" failure even with the thread open.
-    // ColdDMs never persists thread_id; it re-derives the thread live. So we
-    // open a neutral page and let the content script open the thread by username.
-    // thread_id / assigned_thread_id remain stored for observability only.
+    // Follow-ups route through the MAIN tab's normal sendMessage path — exactly
+    // like first_dm — which already handles init-wait, switch-account, openUser
+    // retry and thread-open verification. This mirrors ColdDMs, where every send
+    // (including follow-ups) runs on the main tab and the additional tab is used
+    // only as a fallback via the sendMessageAdditionalTab emit.
+    //
+    // We route by USERNAME, not the stored thread_id: the stored thread_id is a
+    // URL numeric id captured in a previous session; Instagram's open-check
+    // (_checkIfOpenUserRequired) compares it against the live React store's
+    // thread_key, and the two schemes don't always match — causing a false
+    // "Dialog is not opened" failure even with the thread open. ColdDMs never
+    // persists thread_id; it re-derives the thread live. thread_id /
+    // assigned_thread_id remain stored for observability only.
     const targetUrl = null;
-    debugLog(`[Followup] Routing by username (live thread resolution) for ${targetUsername}`);
+    debugLog(`[Followup] Routing via main-tab sendMessage (live thread resolution) for ${targetUsername}`);
 
     const payload = {
       target: { username: targetUsername },
       message: { text: task.message_text },
       taskId: task.id,
-      skipMessageExistsCheck: false
+      skipMessageExistsCheck: false,
+      isOpenNewTab: false
     };
 
     return new Promise((resolve, reject) => {
       let resolved = false;
 
       const handler = (message, sender) => {
-        if (sender.tab?.id !== state.additionalTabId) return;
+        if (sender.tab?.id !== state.mainTabId && sender.tab?.id !== state.additionalTabId) return;
         if (message.type === "adblock:info:to-background" && message.isEmit) {
           const payload = message.data;
           if (payload.type === "successTask" && payload.data.taskId === task.id) {
@@ -1084,7 +1090,7 @@ async function executeTask(task) {
 
       (async () => {
         try {
-          const res = await sendTaskToContent("additional", "sendMessageFromDialog", payload, targetUrl);
+          const res = await sendTaskToContent("main", "sendMessage", payload, targetUrl);
           if (!res?.success) {
             if (!resolved) {
               resolved = true;
@@ -1507,6 +1513,31 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       // already handled by the Promise listener in executeTask
       sendResponse({ success: true });
       return;
+    }
+
+    // sendMessageAdditionalTab: main-tab sendMessage couldn't open the thread,
+    // so it delegated to us (fallback). Open the additional tab pointed at the
+    // thread's live URL and send from there — mirrors ColdDMs startTaskForAdditionalTab.
+    if (taskType === "sendMessageAdditionalTab") {
+      (async () => {
+        try {
+          const threadId = taskData?.threadId;
+          const threadUrl = threadId ? `https://www.instagram.com/direct/t/${threadId}/` : null;
+          debugLog(`[Fallback] Opening additional tab for thread ${threadUrl || "(no thread id)"}`);
+          await sendTaskToContent("additional", "sendMessageFromDialog", {
+            target: taskData?.target,
+            message: taskData?.message,
+            taskId: taskData?.taskId,
+            isTakeSnapshot: taskData?.isTakeSnapshot,
+            skipMessageExistsCheck: taskData?.skipMessageExistsCheck
+          }, threadUrl);
+          sendResponse({ success: true });
+        } catch (err) {
+          debugLog(`[Fallback] Additional-tab send failed: ${err.message}`);
+          sendResponse({ success: false, error: err.message });
+        }
+      })();
+      return true;
     }
 
     // saveMessages: content script sends read receipts for processing

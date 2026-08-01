@@ -913,6 +913,24 @@ class Instagram {
         isTakeSnapshot: a,
         skipMessageExistsCheck: r = !1
       }) => {
+        this.log({ type: "[sendMessageFromDialog] Task started", data: { taskId: s, isBusy: this.isBusy, isInitializing: this.isInitializing } });
+
+        // Wait for initAdditional to finish if it's currently running (max 60 seconds)
+        // — same guard as sendMessage has for initMain. Without this, a task sent
+        // while initAdditional() is mid-flight blocks forever on domConnector sends
+        // that only resolve after injectIntoChat completes (the React connector
+        // isn't ready until then), then times out after 5 minutes.
+        let initWaitElapsed = 0;
+        while (this.isInitializing && initWaitElapsed < 60) {
+          this.log({ type: "[sendMessageFromDialog] Waiting for initialization to complete...", data: { elapsed: initWaitElapsed } });
+          await this.sleep(1000).catch(() => {});
+          initWaitElapsed++;
+        }
+        if (this.isInitializing) {
+          this.log({ type: "[sendMessageFromDialog] Initialization timeout — forcing proceed", data: {} });
+          this.isInitializing = false;
+        }
+
         var i;
         if (this.isBusy) {
           this.log({ type: "Got send message task but thread is busy", data: {} });
@@ -936,14 +954,16 @@ class Instagram {
               this.log({ type: "[Followup] openUser failed", data: { error: openErr?.toString?.() } });
             }
             if (await this._checkIfOpenUserRequired({ username: e.username })) {
-              this.backgroundConnector.emit("errorTask", {
-                error: "Dialog is not opened in additional tab",
-                errorType: "additional_tab_error",
-                taskId: s,
-                taskType: "sendMessage",
-                additionalTab: !0
+              // Hard failure after self-recovery attempt. THROW (not emit+return):
+              // emitting errorTask and returning normally makes processMessage wrap
+              // this as {success:true}, so background logs "successfully sent" while
+              // the UI shows "Permanently Failed" — the log lies. Throwing makes the
+              // response {success:false} AND the outer catch re-emits errorTask, so
+              // log, UI and the executeTask promise all agree.
+              throw new ExtensionError({
+                type: "additional_tab_error",
+                message: "Dialog is not opened in additional tab"
               });
-              return;
             }
           }
           {
@@ -1205,21 +1225,36 @@ class Instagram {
   async _checkIfOpenUserRequired({
     username: e
   }) {
-    var t, s = (await this.domConnector.send("getAllMessages", {}))[e];
-    return this.log({
+    var t, all = await this.domConnector.send("getAllMessages", {}),
+      s = all[e];
+    t = window.location.href.match(/direct\/t\/(\d+)/)?.[1];
+    this.log({
       type: "Checking if user thread is opened",
       data: {
         messages: s ?? {},
-        username: e
-      }
-    }), !s || (t = window.location.href.match(/direct\/t\/(\d+)/)?.[1], this.log({
-      type: "Checking thread ids",
-      data: {
-        messages: s ?? {},
         username: e,
-        message: `threadId: ${t}, threadKey: ` + s.thread_key
+        threadId: t,
+        threadKey: s?.thread_key ?? null
       }
-    }), !t) || t !== s.thread_key
+    });
+    // 1. No thread info for this user in the store — can't confirm it's open.
+    // 2. Not on a /direct/t/ page (inbox or elsewhere) — nothing is open.
+    if (!s || !t) return true;
+    // 3. URL thread id matches this user's thread_key — it's open.
+    if (String(t) === String(s.thread_key)) return false;
+    // 4. The URL thread id belongs to a DIFFERENT user's thread in the store —
+    //    wrong thread is open, must open the target. Guards against sending a
+    //    follow-up into another conversation when the tab was left on a thread.
+    for (const [user, info] of Object.entries(all)) {
+      if (info?.thread_key && String(info.thread_key) === String(t)) {
+        return user !== e;
+      }
+    }
+    // 5. URL shows a thread page but its id doesn't match any stored thread_key —
+    //    the id/thread_key schemes differ for an otherwise-open thread (the known
+    //    false "Dialog is not opened" bug). Treat it as open and proceed.
+    this.log({ type: "Thread id schemes differ but /direct/t/ is open — accepting", data: { username: e, threadId: t } });
+    return false;
   }
   async getDelayedTask() {
     var e = (await chrome.storage.local.get(["delayed_task"]))["delayed_task"];
