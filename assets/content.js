@@ -621,7 +621,6 @@ class Instagram {
         isTakeSnapshot: i,
         isOpenNewTab: n = !1,
         skipMessageExistsCheck: o = !1,
-        usePreresolvedNames: _usePreresolved = !0,
         hasImage: _hasImage = !1,
         imageUsername: _imageUsername = null,
         imageType: _imageType = null,
@@ -728,25 +727,27 @@ class Instagram {
                     type: "Message from user exists, skipping send message",
                     data: {}
                   });
-                  var p = (await this.domConnector.send("getAllMessages", {}))[e.username],
-                    k = p.thread_key;
-                  const a = p.instagram_id;
+                  var k = window.location.href.match(/direct\/t\/(\d+)/)?.[1] ?? g?.thread_key;
                   return this.backgroundConnector.emit("successTask", {
                     result: !0,
                     taskId: s,
                     threadId: k,
                     taskType: "sendMessage",
-                    targetUserId: a,
+                    targetUserId: g?.instagram_id ?? _targetUserId ?? null,
                     response: !0,
                     text: m.text
                   }), !0
                 }
               }
               var f;
-              if (_usePreresolved) {
+              if (!t.text.includes("{{")) {
+                // No unresolved placeholders — the backend already resolved the
+                // message (or it has none), send it as-is. No IG lookup needed.
                 f = t.text;
-                this.log({ type: "Using pre-resolved message (skipped IG lookup)", data: {} });
+                this.log({ type: "Using pre-resolved message (no placeholders)", data: {} });
               } else {
+                // Unresolved {{placeholder}} (backend had no name for this lead)
+                // — scrape the real name from Instagram and fill it in.
                 let s = null;
                 try {
                   s = await this.domConnector.send("getUserByUsername", { username: e.username });
@@ -888,7 +889,9 @@ class Instagram {
               taskId: s,
               taskType: "sendMessage"
             });
-            throw new Error(`User is unreachable: ${unreachableType}`);
+            // Unreachable is a terminal, expected outcome — report it once and
+            // stop. (Previously this also `throw`n, which fell into the catch
+            // below and emitted a second errorTask with a wasted screenshot.)
           }
         } catch (e) {
           throw await this.screenshot(), this.backgroundConnector.emit("errorTask", {
@@ -968,28 +971,28 @@ class Instagram {
             });
             if (!o || ["0", "3"].includes(o.contact_reachability_status_type)) {
               if (!r && !SETTINGS.IGNORE_MESSAGE_EXISTS && o?.messages?.length) {
-                var c, d, l, h = await this.checkResponseByReactAPI(e);
+                var d, h = await this.checkResponseByReactAPI(e);
                 if (Boolean(h)) return this.log({
                   type: "Message from user exists, skipping send message",
                   data: {}
-                }), d = (c = (await this.domConnector.send("getAllMessages", {}))[e.username]).thread_key, l = c.instagram_id, this.backgroundConnector.emit("successTask", {
+                }), d = window.location.href.match(/direct\/t\/(\d+)/)?.[1] ?? o?.thread_key, this.backgroundConnector.emit("successTask", {
                   result: !0,
                   taskId: s,
                   threadId: d,
                   taskType: "sendMessage",
-                  targetUserId: l,
+                  targetUserId: o?.instagram_id ?? null,
                   response: !0,
                   text: h.text,
                   additionalTab: !0
                 }), !0
               }
               var g;
-              var _dialogPreresolved = !1;
-              try { var _ps = await chrome.storage.local.get('usePreresolvedNames'); _dialogPreresolved = _ps.usePreresolvedNames !== !1; } catch(e) {}
-              if (_dialogPreresolved) {
+              if (!t.text.includes("{{")) {
                 g = t.text;
-                this.log({ type: "Using pre-resolved message (skipped IG lookup)", data: {} });
+                this.log({ type: "Using pre-resolved message (no placeholders)", data: {} });
               } else {
+                // Unresolved {{placeholder}} (backend had no name for this lead)
+                // — scrape the real name from Instagram and fill it in.
                 let s = null;
                 try {
                   s = await this.domConnector.send("getUserByUsername", { username: e.username });

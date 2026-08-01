@@ -32,7 +32,6 @@ document.addEventListener('DOMContentLoaded', async () => {
   const baseDelayIn = document.getElementById('baseDelay');
   const minVarianceIn = document.getElementById('minVariance');
   const maxVarianceIn = document.getElementById('maxVariance');
-  const preresolvedToggle = document.getElementById('usePreresolvedToggle');
 
   const imageUploadInput = document.getElementById('imageUploadInput');
   const selectImagesBtn = document.getElementById('selectImagesBtn');
@@ -205,14 +204,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     a.click();
     URL.revokeObjectURL(url);
   });
-
-  if (preresolvedToggle) {
-    const saved = await chrome.storage.local.get('usePreresolvedNames');
-    preresolvedToggle.checked = saved.usePreresolvedNames !== false;
-    preresolvedToggle.addEventListener('change', async () => {
-      await chrome.storage.local.set({ usePreresolvedNames: preresolvedToggle.checked });
-    });
-  }
 
   // Initial load of image count
   if (globalThis.ImageStorage && imageCountDisplay) {

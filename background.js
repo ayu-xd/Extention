@@ -808,9 +808,6 @@ async function executeTask(task) {
     const targetUsername = task.contacts?.username;
     if (!targetUsername) throw new Error("Missing target username in contact relation");
 
-    const nameSettings = await chrome.storage.local.get('usePreresolvedNames');
-    const usePreresolved = nameSettings.usePreresolvedNames !== false; // default ON
-
     let hasImage = false;
     let imageUsername = null;
     let imageArrayBuffer = null;
@@ -857,7 +854,6 @@ async function executeTask(task) {
       target: { username: targetUsername },
       message: { text: finalMessageText },
       taskId: task.id,
-      usePreresolvedNames: usePreresolved,
       hasImage,
       imageUsername,
       imageType,
@@ -1006,7 +1002,6 @@ async function executeTask(task) {
       target: { username: targetUsername },
       message: { text: task.message_text },
       taskId: task.id,
-      usePreresolvedNames: true,
       skipMessageExistsCheck: false
     };
 
