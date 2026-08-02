@@ -739,7 +739,7 @@ class Instagram {
                   }), !0
                 }
               }
-              var f;
+              var f, _resolvedFullName = null;
               if (!t.text.includes("{{")) {
                 // No unresolved placeholders — the backend already resolved the
                 // message (or it has none), send it as-is. No IG lookup needed.
@@ -748,36 +748,9 @@ class Instagram {
               } else {
                 // Unresolved {{placeholder}} (backend had no name for this lead)
                 // — scrape the real name from Instagram and fill it in.
-                let s = null;
-                try {
-                  s = await this.domConnector.send("getUserByUsername", { username: e.username });
-                } catch (e) {}
-                if (s) {
-                  f = t.text
-                    .replaceAll("{{username}}", e.username)
-                    .replaceAll("{{name}}", s?.full_name ?? e.username)
-                    .replace(/[ \t]*\{\{firstName\}\}[ \t]*/g, (e) => {
-                      var t = (t = s)
-                        ? t.full_name
-                          ? t.full_name.includes(" ")
-                            ? normalizeUnicodeText(
-                                parseFullName(t.full_name)?.first ||
-                                  t.username ||
-                                  "",
-                              )
-                            : normalizeUnicodeText(t.full_name || "")
-                          : normalizeUnicodeText(t.username || "")
-                        : "";
-                      return t
-                        ? e.replace("{{firstName}}", t)
-                        : /^[ \t]/.test(e) && /[ \t]$/.test(e)
-                          ? " "
-                          : "";
-                    });
-                } else {
-                  f = t.text;
-                  this.log({ type: "getUserByUsername returned undefined, using raw message", data: {} });
-                }
+                var _resolved = await this._resolveLiveName(t.text, e.username);
+                f = _resolved.message;
+                _resolvedFullName = _resolved.fullName;
               }
               this.log({
                 type: "Prepared message",
@@ -878,7 +851,8 @@ class Instagram {
                 taskId: s,
                 threadId: w,
                 taskType: "sendMessage",
-                targetUserId: g?.instagram_id ?? _targetUserId ?? null
+                targetUserId: g?.instagram_id ?? _targetUserId ?? null,
+                resolvedFullName: _resolvedFullName || null
               }), !0
             }
             const unreachableType = g ? u[g.contact_reachability_status_type] : "UNKNOWN";
@@ -1006,43 +980,16 @@ class Instagram {
                   additionalTab: !0
                 }), !0
               }
-              var g;
+              var g, _resolvedFullName = null;
               if (!t.text.includes("{{")) {
                 g = t.text;
                 this.log({ type: "Using pre-resolved message (no placeholders)", data: {} });
               } else {
                 // Unresolved {{placeholder}} (backend had no name for this lead)
                 // — scrape the real name from Instagram and fill it in.
-                let s = null;
-                try {
-                  s = await this.domConnector.send("getUserByUsername", { username: e.username });
-                } catch (e) {}
-                if (s) {
-                  g = t.text
-                    .replaceAll("{{username}}", e.username)
-                    .replaceAll("{{name}}", s?.full_name ?? e.username)
-                    .replace(/[ \t]*\{\{firstName\}\}[ \t]*/g, (e) => {
-                      var t = (t = s)
-                        ? t.full_name
-                          ? t.full_name.includes(" ")
-                            ? normalizeUnicodeText(
-                                parseFullName(t.full_name)?.first ||
-                                  t.username ||
-                                  "",
-                              )
-                            : normalizeUnicodeText(t.full_name || "")
-                          : normalizeUnicodeText(t.username || "")
-                        : "";
-                      return t
-                        ? e.replace("{{firstName}}", t)
-                        : /^[ \t]/.test(e) && /[ \t]$/.test(e)
-                          ? " "
-                          : "";
-                    });
-                } else {
-                  g = t.text;
-                  this.log({ type: "getUserByUsername returned undefined, using raw message", data: {} });
-                }
+                var _resolved = await this._resolveLiveName(t.text, e.username);
+                g = _resolved.message;
+                _resolvedFullName = _resolved.fullName;
               }
               var m = (this.log({
                   type: "Prepared message",
@@ -1059,6 +1006,7 @@ class Instagram {
                 threadId: m,
                 taskType: "sendMessage",
                 targetUserId: o?.instagram_id ?? null,
+                resolvedFullName: _resolvedFullName || null,
                 additionalTab: !0
               }), !0
             }
@@ -1131,7 +1079,8 @@ class Instagram {
           });
           var {
             lastMessageTimestamp: c,
-            lastMessageId: d
+            lastMessageId: d,
+            resolvedFullName: _resolvedFullName
           } = await this._sendDirectMessage({
             target: {
               username: e
@@ -1148,7 +1097,8 @@ class Instagram {
             targetUsername: e,
             text: a.text,
             lastMessageTimestamp: c,
-            lastMessageId: d
+            lastMessageId: d,
+            resolvedFullName: _resolvedFullName || null
           })
         } catch (e) {
           throw await this.screenshot(), "user_is_unreachable" === e.type ? this.backgroundConnector.emit("errorTask", {
@@ -1647,6 +1597,43 @@ class Instagram {
       await this.sleep(1e3)
     }
   }
+  async _resolveLiveName(t, e) {
+    // t = raw template text, e = username.
+    // Returns { message, fullName }. Never sends a literal {{placeholder}}:
+    //  - no `{{` → already resolved server-side, send as-is.
+    //  - scrape succeeds → fill real name, return it (for DB write-back).
+    //  - scrape fails → clean-strip the placeholders, never leak literal tokens.
+    if (!t.includes("{{")) return { message: t, fullName: null };
+    let s = null;
+    try {
+      s = await this.domConnector.send("getUserByUsername", { username: e });
+    } catch (err) {}
+    if (s) {
+      const firstName = (u) =>
+        u?.full_name
+          ? u.full_name.includes(" ")
+            ? normalizeUnicodeText(parseFullName(u.full_name)?.first || u.username || "")
+            : normalizeUnicodeText(u.full_name || "")
+          : normalizeUnicodeText(u.username || "");
+      const fn = firstName(s);
+      const message = t
+        .replace(/\{\{\s*username\s*\}\}/gi, () => e)
+        .replace(/\{\{\s*name\s*\}\}/gi, () => s?.full_name ?? e)
+        .replace(/[ \t]*\{\{\s*firstName\s*\}\}[ \t]*/g, (m) =>
+          fn
+            ? m.replace(/\{\{\s*firstName\s*\}\}/, fn)
+            : /^[ \t]/.test(m) && /[ \t]$/.test(m) ? " " : "");
+      this.log({ type: "Resolved live name from Instagram", data: { fullName: s.full_name, message } });
+      return { message, fullName: s.full_name || null };
+    }
+    const message = t
+      .replace(/\{\{\s*username\s*\}\}/gi, () => e)
+      .replace(/\{\{\s*name\s*\}\}/gi, () => e)
+      .replace(/[ \t]*\{\{\s*firstName\s*\}\}[ \t]*/g, (m) =>
+        /^[ \t]/.test(m) && /[ \t]$/.test(m) ? " " : "");
+    this.log({ type: "getUserByUsername failed — stripped unresolved placeholders", data: { message } });
+    return { message, fullName: null };
+  }
   async back() {
     for (let e = 0; e < 10; e++)
       if (document.querySelector('a[href="/"]')?.click(), await this.sleep(1e3), "https://www.instagram.com/" === document.location.href || "https://www.instagram.com" === document.location.href) {
@@ -1728,30 +1715,11 @@ class Instagram {
         unreachableType: n[r.contact_reachability_status_type]
       });
       let e = s.text;
+      let _resolvedFullName = null;
       if (e.includes("{{")) {
-        let w = null;
-        try {
-          w = await this.domConnector.send("getUserByUsername", { username: t.username });
-        } catch (e) {}
-        e = s.text
-          .replaceAll("{{username}}", t.username)
-          .replaceAll("{{name}}", w?.full_name ?? t.username)
-          .replace(/[ \t]*\{\{firstName\}\}[ \t]*/g, (e) => {
-            var t = (t = w)
-              ? t.full_name
-                ? t.full_name.includes(" ")
-                  ? normalizeUnicodeText(
-                      parseFullName(t.full_name)?.first || t.username || "",
-                    )
-                  : normalizeUnicodeText(t.full_name || "")
-                : normalizeUnicodeText(t.username || "")
-              : "";
-            return t
-              ? e.replace("{{firstName}}", t)
-              : /^[ \t]/.test(e) && /[ \t]$/.test(e)
-                ? " "
-                : "";
-          });
+        var _resolved = await this._resolveLiveName(s.text, t.username);
+        e = _resolved.message;
+        _resolvedFullName = _resolved.fullName;
       }
       await this.sleep(5e3), await this._sendMessage({
         text: e,
@@ -1765,7 +1733,8 @@ class Instagram {
         threadId: o,
         targetUserId: r?.instagram_id,
         lastMessageTimestamp: c,
-        lastMessageId: d
+        lastMessageId: d,
+        resolvedFullName: _resolvedFullName || null
       }
     } catch (e) {
       throw console.log("[sendDirectMessage] Error:", e), e

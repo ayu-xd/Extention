@@ -652,7 +652,7 @@ async function pollTasks() {
     delete task.campaigns;
 
     if (task.contact_id) {
-      const contacts = await supabaseReq(`contacts?select=username&id=eq.${task.contact_id}`);
+      const contacts = await supabaseReq(`contacts?select=username,full_name&id=eq.${task.contact_id}`);
       if (contacts && contacts.length > 0) {
         task.contacts = contacts[0];
       }
@@ -909,6 +909,29 @@ async function executeTask(task) {
                     await caoUpsert(task.contact_id, { assigned_thread_id: data.threadId });
                   }
                 }
+                // Write back a live-resolved real name so follow-ups use the fast
+                // server-side path instead of re-scraping every time. Only when:
+                //  - the extension actually scraped a name this send (resolvedFullName),
+                //  - and the stored full_name is still a username-placeholder
+                //    (empty or equal to the username) — never clobber a real name
+                //    or a manual override the user set.
+                if (data.resolvedFullName && task.contact_id) {
+                  try {
+                    const storedFull = (task.contacts?.full_name || "").trim();
+                    const storedUser = (task.contacts?.username || "").replace(/^@/, "").trim().toLowerCase();
+                    const isPlaceholder = !storedFull || storedFull.trim().toLowerCase() === storedUser;
+                    const newFull = String(data.resolvedFullName).trim();
+                    if (isPlaceholder && newFull && newFull.toLowerCase() !== storedFull.toLowerCase()) {
+                      await supabaseReq(`contacts?id=eq.${task.contact_id}`, "PATCH", {
+                        full_name: newFull
+                      });
+                      debugLog(`[Name] Persisted live-resolved full_name for ${task.contact_id}: "${newFull}"`);
+                    }
+                  } catch (e) {
+                    // Non-fatal: resolution still worked, only the write-back failed.
+                    debugLog(`[Name] Write-back skipped for ${task.contact_id}: ${e?.toString()}`);
+                  }
+                }
                 if (data.response === true && task.contact_id) {
                   debugLog(`[Guard] Lead replied — skipping send for task ${task.id}, cancelling remaining follow-ups.`);
                   await cancelPendingFollowups(task.contact_id, "lead_replied");
@@ -1148,7 +1171,6 @@ async function executeTask(task) {
                         user_id: task.user_id,
                         username: t.username,
                         full_name: t.fullName || t.username,
-                        profile_link: `https://instagram.com/${t.username}`,
                         status: 'not_started'
                       }));
 
