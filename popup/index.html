@@ -776,8 +776,11 @@
   <main class="shell">
     <section id="loginView" class="view hidden">
       <p class="kicker">DMDroid</p>
-      <h1 class="headline">Sign in to pair.</h1>
-      <p class="subcopy">Connect this extension to your dashboard and keep the browser worker synced.</p>
+      <h1 class="headline">Connect to DMDroid.</h1>
+      <p class="subcopy">Open the DMDroid web app to pair this browser automatically. No keys, no copy-paste.</p>
+      <button id="connectAppBtn" class="primary-btn">Connect to DMDroid</button>
+      <div id="connectMessage" class="message"></div>
+      <div class="divider" style="margin:20px 0;text-align:center;color:var(--muted-2);font-size:11px;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;">Or sign in manually</div>
       <div class="form-group">
         <label for="email">Email</label>
         <input type="email" id="email" placeholder="Your account email" autocomplete="email">
@@ -786,7 +789,7 @@
         <label for="password">Password</label>
         <input type="password" id="password" placeholder="Your password" autocomplete="current-password">
       </div>
-      <button id="loginBtn" class="primary-btn">Login</button>
+      <button id="loginBtn" class="secondary-btn">Login manually</button>
       <div id="loginMessage" class="message"></div>
     </section>
 

@@ -4,6 +4,8 @@ document.addEventListener('DOMContentLoaded', async () => {
   const activeView = document.getElementById('activeView');
 
   const loginBtn = document.getElementById('loginBtn');
+  const connectAppBtn = document.getElementById('connectAppBtn');
+  const connectMessage = document.getElementById('connectMessage');
   const connectBtn = document.getElementById('connectBtn');
   const logoutBtn = document.getElementById('logoutBtn');
   const disconnectBtn = document.getElementById('disconnectBtn');
@@ -54,10 +56,11 @@ document.addEventListener('DOMContentLoaded', async () => {
   const logsScreen = document.getElementById('logsScreen');
   const settingsScreen = document.getElementById('settingsScreen');
 
-  let state, storedLogs;
+  let state, storedLogs, sessionExpired;
   try {
-    state = await chrome.storage.local.get(['accessToken', 'browserId', 'browserLabel', 'stats']);
+    state = await chrome.storage.local.get(['accessToken', 'browserId', 'browserLabel', 'stats', 'sessionExpired']);
     storedLogs = await chrome.storage.local.get('engineLogs');
+    sessionExpired = state.sessionExpired;
   } catch (e) {
     state = { accessToken: null, browserId: null, browserLabel: null, stats: null };
     storedLogs = {};
@@ -68,7 +71,12 @@ document.addEventListener('DOMContentLoaded', async () => {
     debugDiv.scrollTop = debugDiv.scrollHeight;
   }
 
-  if (state.accessToken && state.browserId) {
+  // Session expired check — show reconnect screen, not a fake "Online"
+  if (sessionExpired) {
+    showLoginView();
+    if (connectAppBtn) connectAppBtn.textContent = 'Reconnect to DMDroid';
+    showMessage(connectMessage, 'Your session expired. Click Reconnect and log into dmdroid.app to continue.', 'error');
+  } else if (state.accessToken && state.browserId) {
     showActiveView(state.browserLabel, state.stats);
   } else if (state.accessToken) {
     showSelectView();
@@ -95,6 +103,40 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
   });
 
+  // Connect to DMDroid — opens the web app in a popup window.
+  // The webapp-content.js detects the Supabase session and syncs it to
+  // the background, which auto-pairs. This is the closest equivalent to
+  // ColdDMs' device-code flow using Supabase (no custom server endpoint needed).
+  let connectWindowId = null;
+
+  connectAppBtn?.addEventListener('click', async () => {
+    connectAppBtn.textContent = 'Waiting for login...';
+    connectAppBtn.disabled = true;
+    showMessage(connectMessage, 'A DMDroid login window opened. Log in there — this browser connects automatically.', '');
+
+    // Open the web app login page in a popup window
+    const appUrl = 'https://app.dmdroid.app/auth';
+    const win = await chrome.windows.create({
+      url: appUrl,
+      type: 'popup',
+      width: 480,
+      height: 700,
+    });
+    connectWindowId = win.id;
+
+    // The webapp-content.js fires HUB_SESSION_SYNCED → background auto-pairs
+    // → sends HUB_CONNECTED_SUCCESS → the message listener below catches it,
+    // closes the popup window, and shows the active view.
+    // Timeout after 2 minutes (generous — user might need to log in first).
+    setTimeout(() => {
+      if (connectWindowId !== null) {
+        connectAppBtn.textContent = 'Connect to DMDroid';
+        connectAppBtn.disabled = false;
+        showMessage(connectMessage, 'Still waiting? Make sure you log in at app.dmdroid.app in the popup window, then come back here.', '');
+      }
+    }, 120000);
+  });
+
   connectBtn.addEventListener('click', async () => {
     let selectedId = browserSelect.value;
     let selectedLabel = browserSelect.options[browserSelect.selectedIndex]?.text || 'Manual Connection';
@@ -118,9 +160,20 @@ document.addEventListener('DOMContentLoaded', async () => {
   });
 
   logoutBtn.addEventListener('click', async () => {
-    await chrome.storage.local.clear();
+    // Logout clears AUTH only — NEVER clear browserId/instanceKey. Those define
+    // "this physical browser"; preserving them lets a later login RE-ADOPT the
+    // same browser row instead of fabricating a duplicate. (storage.clear()
+    // wiped them and caused duplicate "Chrome / Online" rows on every re-login.)
+    await chrome.storage.local.remove([
+      'accessToken',
+      'refreshToken',
+      'sessionExpired',
+      'enginePaused',
+      'wakeUpAt',
+    ]);
     chrome.runtime.sendMessage({ type: 'HUB_DISCONNECT' });
     showLoginView();
+    if (state) state.sessionExpired = true;
   });
 
   disconnectBtn.addEventListener('click', async () => {
@@ -283,6 +336,12 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   chrome.runtime.onMessage.addListener((msg) => {
     if (msg.type === 'HUB_LOGIN_SUCCESS') {
+      // Close the login popup window if it's still open — the session sync
+      // has succeeded, so we no longer need the web app tab.
+      if (connectWindowId !== null) {
+        chrome.windows.remove(connectWindowId).catch(() => {});
+        connectWindowId = null;
+      }
       showSelectView();
       fetchBrowsers();
     }
@@ -313,6 +372,17 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
 
     if (msg.type === 'HUB_CONNECTED_SUCCESS') {
+      // Close the login popup window if it's still open
+      if (connectWindowId !== null) {
+        chrome.windows.remove(connectWindowId).catch(() => {});
+        connectWindowId = null;
+      }
+      // Reset connect button if it was in "opening" state
+      if (connectAppBtn) {
+        connectAppBtn.textContent = 'Connect to DMDroid';
+        connectAppBtn.disabled = false;
+      }
+      if (connectMessage) showMessage(connectMessage, '', '');
       showActiveView(msg.label, msg.stats);
     }
 
@@ -320,6 +390,23 @@ document.addEventListener('DOMContentLoaded', async () => {
       showMessage(selectMessage, msg.error || 'Connection failed', 'error');
       connectBtn.textContent = 'Connect to Hub';
       connectBtn.disabled = false;
+    }
+
+    if (msg.type === 'HUB_SESSION_EXPIRED') {
+      // Session died (refresh token failed). Show reconnect screen — not a
+      // fake "Online" state. The user needs to reopen the web app to re-sync.
+      loginView.classList.remove('hidden');
+      selectView.classList.add('hidden');
+      activeView.classList.add('hidden');
+      if (connectAppBtn) {
+        connectAppBtn.textContent = 'Reconnect to DMDroid';
+        connectAppBtn.disabled = false;
+      }
+      showMessage(connectMessage, 'Your session expired. Click Reconnect and log into dmdroid.app to continue.', 'error');
+      if (loginBtn) {
+        loginBtn.textContent = 'Login manually';
+        loginBtn.disabled = false;
+      }
     }
 
     if (msg.type === 'STATS_UPDATE' && tasksCompletedDisplay) {

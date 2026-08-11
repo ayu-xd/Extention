@@ -8,6 +8,8 @@ let state = {
   refreshToken: null,
   browserId: null,
   browserLabel: null,
+  instanceKey: null,
+  lastSessionSync: 0,
   stats: { completed: 0, failed: 0 },
   isProcessing: false,
   processingLockAcquiredAt: 0,
@@ -157,10 +159,22 @@ async function refreshAccessToken() {
     state.accessToken = data.access_token;
     state.refreshToken = data.refresh_token;
     await chrome.storage.local.set({ accessToken: state.accessToken, refreshToken: state.refreshToken });
+    // Clear any previous session-expired flag
+    await chrome.storage.local.remove('sessionExpired');
     debugLog("Token refreshed!");
     return true;
   } catch (err) {
     debugLog(`Refresh failed: ${err.message}`);
+    // Session honesty: mark as expired so the popup shows "Reconnect"
+    // instead of a fake "Online" state. Clear tokens but keep browserId
+    // so re-sync can re-adopt the same browser row.
+    state.accessToken = null;
+    state.refreshToken = null;
+    await chrome.storage.local.set({ sessionExpired: true });
+    await chrome.storage.local.remove(['accessToken', 'refreshToken']);
+    stopEngine();
+    chrome.runtime.sendMessage({ type: "HUB_SESSION_EXPIRED" }).catch(()=>null);
+    debugLog("[Session] Marked as expired. Popup will show Reconnect screen.");
     return false;
   }
 }
@@ -170,11 +184,12 @@ async function refreshAccessToken() {
 // ---------------------------------------------------------------------------
 
 async function init() {
-  const data = await chrome.storage.local.get(['accessToken', 'refreshToken', 'browserId', 'browserLabel', 'stats', 'mainTabId', 'additionalTabId', 'enginePaused']);
+  const data = await chrome.storage.local.get(['accessToken', 'refreshToken', 'browserId', 'browserLabel', 'instanceKey', 'stats', 'mainTabId', 'additionalTabId', 'enginePaused']);
   if (data.accessToken) state.accessToken = data.accessToken;
   if (data.refreshToken) state.refreshToken = data.refreshToken;
   if (data.browserId) state.browserId = data.browserId;
   if (data.browserLabel) state.browserLabel = data.browserLabel;
+  if (data.instanceKey) state.instanceKey = data.instanceKey;
   if (data.stats) state.stats = data.stats;
   if (data.mainTabId) state.mainTabId = data.mainTabId;
   if (data.additionalTabId) state.additionalTabId = data.additionalTabId;
@@ -242,6 +257,140 @@ function getUserIdFromToken(token) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Auto-Pair: create or adopt a browser_instances row without user input.
+// Called after session sync or login. RLS permits owner-scoped inserts.
+// Handles UNIQUE(ig_username) conflicts by adopting the existing row.
+// ---------------------------------------------------------------------------
+
+function generateInstanceKey() {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  let key = "";
+  for (let i = 0; i < 12; i++) {
+    if (i > 0 && i % 4 === 0) key += "-";
+    key += chars[Math.floor(Math.random() * chars.length)];
+  }
+  return key;
+}
+
+// Ensures this browser has a STABLE instance_key persisted in chrome.storage.
+// The key (not row count) is the identity of "this physical browser": it lets us
+// tell apart "the same machine reconnecting" (same key → adopt) from "a new
+// distinct browser" (different key → always create a fresh row).
+async function ensureInstanceKey() {
+  if (state.instanceKey) return state.instanceKey;
+  let stored = null;
+  try {
+    stored = (await chrome.storage.local.get('instanceKey')).instanceKey || null;
+  } catch (e) {}
+  if (stored) {
+    state.instanceKey = stored;
+    return stored;
+  }
+  const key = generateInstanceKey();
+  state.instanceKey = key;
+  try {
+    await chrome.storage.local.set({ instanceKey: key });
+  } catch (e) {}
+  debugLog(`[AutoPair] Created persistent instance key: ${key}`);
+  return key;
+}
+
+async function autoPairBrowser() {
+  if (state.browserId) {
+    debugLog("[AutoPair] Already paired — skipping.");
+    return;
+  }
+
+  const userId = getUserIdFromToken(state.accessToken);
+  if (!userId) {
+    debugLog("[AutoPair] No valid token — cannot pair.");
+    return;
+  }
+
+  try {
+    // This browser's stable identity. Whoever owns this key owns the row.
+    const myKey = await ensureInstanceKey();
+
+    // Fetch this user's existing rows (including instance_key) so we can
+    // tell a re-adopt (same key) apart from a brand-new browser (new key).
+    const existing = await supabaseReq(
+      `browser_instances?user_id=eq.${userId}&select=id,label,instance_key,ig_username&order=created_at.desc`
+    );
+    const mine = (existing || []).find(r => r.instance_key === myKey);
+
+    if (mine) {
+      // Same key = this same extension reconnecting → adopt this row.
+      state.browserId = mine.id;
+      state.browserLabel = mine.label || "Browser";
+      await chrome.storage.local.set({
+        browserId: state.browserId,
+        browserLabel: state.browserLabel,
+      });
+      debugLog(`[AutoPair] Adopted same-instance browser: ${mine.label} (${mine.id})`);
+    } else {
+      // No row matches our key → this is a NEW distinct browser. Create one.
+      // A different key on an existing row is NOT ours to reuse.
+      let key = myKey;
+      let inserted = null;
+      try {
+        inserted = await supabaseReq(
+          `browser_instances`,
+          "POST",
+          {
+            user_id: userId,
+            instance_key: key,
+            label: "Chrome",
+            status: "active",
+          }
+        );
+      } catch (insertErr) {
+        // If 23505 on instance_key (rare collision), retry with new key
+        if (String(insertErr).includes("duplicate") || String(insertErr).includes("23505")) {
+          debugLog("[AutoPair] Key collision — retrying with new key.");
+          const key2 = generateInstanceKey();
+          key = key2;
+          state.instanceKey = key2;
+          await chrome.storage.local.set({ instanceKey: key2 });
+          try {
+            inserted = await supabaseReq(
+              `browser_instances`,
+              "POST",
+              { user_id: userId, instance_key: key2, label: "Chrome", status: "active" }
+            );
+          } catch (retryErr) {
+            throw new Error(`Auto-pair retry failed: ${retryErr}`);
+          }
+        } else {
+          throw new Error(`Auto-pair insert failed: ${insertErr}`);
+        }
+      }
+
+      if (inserted && inserted.length > 0) {
+        state.browserId = inserted[0].id;
+        state.browserLabel = "Chrome";
+      }
+
+      await chrome.storage.local.set({
+        browserId: state.browserId,
+        browserLabel: state.browserLabel,
+      });
+      debugLog(`[AutoPair] Created new browser: ${state.browserId}`);
+    }
+
+    // Start the engine + heartbeat
+    await syncStatsFromDatabase();
+    startEngine();
+    await chrome.storage.local.remove('leaseExpiresAt');
+    _workHoursCache = null;
+    sendHeartbeat(true).catch(()=>{});
+    chrome.runtime.sendMessage({ type: "HUB_CONNECTED_SUCCESS", label: state.browserLabel, stats: state.stats }).catch(()=>null);
+  } catch (err) {
+    debugLog(`[AutoPair] Error: ${err.message}`);
+    chrome.runtime.sendMessage({ type: "HUB_CONNECTED_ERROR", error: err.message }).catch(()=>null);
+  }
+}
+
 async function fetchBrowsers() {
   try {
     const userId = getUserIdFromToken(state.accessToken);
@@ -251,7 +400,19 @@ async function fetchBrowsers() {
       return;
     }
     const browsers = await supabaseReq(`browser_instances?user_id=eq.${userId}&select=id,label,instance_key&order=created_at.desc`);
-    chrome.runtime.sendMessage({ type: "FETCH_BROWSERS_SUCCESS", browsers }).catch(()=>null);
+    const list = browsers || [];
+
+    // Only surface rows that belong to THIS physical browser (same instance_key),
+    // so a user can't accidentally pick a row owned by another machine.
+    const myKey = await ensureInstanceKey();
+    const own = list.filter(b => b.instance_key === myKey);
+
+    // Legacy fallback: if we have NO own-key row yet (e.g. paired before this
+    // fix, so the key was never stored), show all rows so the user can still
+    // pick one. handleConnect will adopt the chosen row's key.
+    const result = own.length > 0 ? own : list;
+
+    chrome.runtime.sendMessage({ type: "FETCH_BROWSERS_SUCCESS", browsers: result }).catch(()=>null);
   } catch (err) {
     debugLog(`Fetch browsers error: ${err.message}`);
   }
@@ -284,7 +445,28 @@ async function handleConnect(browserId, browserLabel) {
     state.browserId = browserId;
     state.browserLabel = browserLabel;
     state.stats = { completed: 0, failed: 0 };
-    
+
+    // Adopt the connected row's instance_key so THIS browser owns it going
+    // forward. This keeps auto-pair, the dropdown filter, and IG-detection all
+    // key-consistent. If the row has no key yet, generate one and stamp it.
+    const myKey = await ensureInstanceKey();
+    try {
+      const rows = await supabaseReq(`browser_instances?select=id,instance_key&eq.id.${browserId}`);
+      const row = rows && rows[0];
+      if (row && row.instance_key && row.instance_key !== myKey) {
+        // The user explicitly chose this row — claim it as this browser.
+        state.instanceKey = row.instance_key;
+        await chrome.storage.local.set({ instanceKey: row.instance_key });
+        debugLog(`[Connect] Adopted instance key ${row.instance_key} for row ${browserId}`);
+      } else if (row && !row.instance_key) {
+        // Row has no key — stamp ours onto it.
+        await supabaseReq(`browser_instances?id=eq.${browserId}`, "PATCH", { instance_key: myKey });
+        debugLog(`[Connect] Stamped instance key ${myKey} onto un-keyed row ${browserId}`);
+      }
+    } catch (adoptErr) {
+      debugLog(`[Connect] Note: could not sync instance_key (${adoptErr.message})`);
+    }
+
     await chrome.storage.local.set({ 
       browserId: state.browserId, 
       browserLabel: state.browserLabel,
@@ -295,7 +477,7 @@ async function handleConnect(browserId, browserLabel) {
 
     startEngine();
     await chrome.storage.local.remove('leaseExpiresAt');
-    await chrome.storage.local.remove('campaignSettingsCache');
+    _workHoursCache = null; // invalidate working-hours cache on new connection
     sendHeartbeat(true).catch(()=>{});
     chrome.runtime.sendMessage({ type: "HUB_CONNECTED_SUCCESS", label: state.browserLabel, stats: state.stats }).catch(()=>null);
   } catch (err) {
@@ -321,7 +503,12 @@ async function startEngine() {
     }
   }
 
-  // Create alarms for Manifest V3 background script (heartbeat is separate — created in init)
+  // Create alarms for the Manifest V3 background script.
+  // Heartbeat must ALWAYS be scheduled whenever a browser is active — the auto-pair
+  // flow never passes through init(), and init() only creates it if a browserId was
+  // already present at boot. Creating here guarantees the 24/7 heartbeat alarm exists
+  // on every connect/pair. (alarms.create is idempotent: same name replaces.)
+  chrome.alarms.create("engine_heartbeat", { periodInMinutes: 1 }); // Every 1 min keep-alive
   chrome.alarms.create("engine_poll", { periodInMinutes: 0.25 }); // 15 seconds
   chrome.alarms.create("engine_refresh_token", { periodInMinutes: 45 }); // Refresh JWT every 45 min
   chrome.alarms.create("engine_collect_messages", { periodInMinutes: 2 }); // Every 2 min read-receipt check
@@ -339,13 +526,34 @@ function stopEngine() {
 }
 
 // Listen to alarms
-chrome.alarms.onAlarm.addListener((alarm) => {
+chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name === "engine_heartbeat") {
     sendHeartbeat().catch(()=>{});
+    // Self-heal: if we have a browserId, aren't paused, but the engine_poll
+    // alarm doesn't exist (e.g. refresh failed at init → engine never started),
+    // restart the engine now. This recovers from the "engine dead" gap.
+    if (state.browserId && state.accessToken) {
+      const paused = await chrome.storage.local.get('enginePaused');
+      if (!paused.enginePaused) {
+        const pollAlarm = await chrome.alarms.get('engine_poll');
+        if (!pollAlarm) {
+          debugLog("[Self-Heal] engine_poll alarm missing but browser is active — restarting engine.");
+          startEngine();
+        }
+      }
+    }
   } else if (alarm.name === "engine_poll") {
     pollTasks().catch(()=>{});
   } else if (alarm.name === "engine_refresh_token") {
-    refreshAccessToken().catch(()=>{});
+    // Only refresh if the web app is NOT open (it owns the token when it is).
+    // The webapp-content.js fires HUB_SESSION_SYNCED every 2s while open,
+    // which updates state.accessToken. If we also refresh, we risk a
+    // rotation collision that kills the token family.
+    if (Date.now() - (state.lastSessionSync || 0) > 15000) {
+      refreshAccessToken().catch(()=>{});
+    } else {
+      debugLog("[Token] Skipping extension refresh — web app is open (it owns the token).");
+    }
   } else if (alarm.name === "engine_collect_messages") {
     collectMessagesJob().catch(()=>{});
   }
@@ -472,47 +680,36 @@ async function cancelPendingFollowups(contactId, reason) {
 }
 
 // ---------------------------------------------------------------------------
-// Working Hours Helpers
+// Working Hours Safety Clamp (not a scheduling brain — the server schedules)
 // ---------------------------------------------------------------------------
 
-async function getActiveCampaignSettings() {
-  const cached = await chrome.storage.local.get('campaignSettingsCache');
-  if (cached.campaignSettingsCache) {
-    const { data, timezone, fetchedAt } = cached.campaignSettingsCache;
-    if (Date.now() - fetchedAt < 30 * 60 * 1000) return { data, timezone };
+let _workHoursCache = null;
+
+async function getUserWorkingHours() {
+  if (_workHoursCache) return _workHoursCache;
+  try {
+    const userId = getUserIdFromToken(state.accessToken);
+    if (!userId) return { start: 9, end: 18, timezone: 'UTC' };
+    const settings = await supabaseReq(`user_settings?select=timezone,work_start_hour,work_end_hour&user_id=eq.${userId}`);
+    const s = settings?.[0];
+    _workHoursCache = {
+      start: s?.work_start_hour ?? 9,
+      end: s?.work_end_hour ?? 18,
+      timezone: s?.timezone || 'UTC'
+    };
+    return _workHoursCache;
+  } catch {
+    return { start: 9, end: 18, timezone: 'UTC' };
   }
-  const userId = getUserIdFromToken(state.accessToken);
-  const [campaigns, userSettings] = await Promise.all([
-    supabaseReq(`campaigns?select=id,working_hours_enabled,work_start_hour,work_end_hour&status=neq.archived`),
-    userId ? supabaseReq(`user_settings?select=timezone&user_id=eq.${userId}`) : Promise.resolve([])
-  ]);
-  const data = campaigns ?? [];
-  const timezone = userSettings?.[0]?.timezone || 'UTC';
-  await chrome.storage.local.set({ campaignSettingsCache: { data, timezone, fetchedAt: Date.now() } });
-  return { data, timezone };
 }
 
-function isInWorkingHours(campaign, timezone) {
-  if (!campaign.working_hours_enabled) return true;
-  const start = campaign.work_start_hour ?? 0;
-  const end = campaign.work_end_hour ?? 24;
+function isWithinWorkingHours(wh) {
   const nowHour = parseInt(
-    new Intl.DateTimeFormat('en-US', { hour: 'numeric', hour12: false, timeZone: timezone }).format(new Date()),
+    new Intl.DateTimeFormat('en-US', { hour: 'numeric', hour12: false, timeZone: wh.timezone }).format(new Date()),
     10
   );
-  if (start < end) return nowHour >= start && nowHour < end;
-  return nowHour >= start || nowHour < end;
-}
-
-function minsUntilWindowOpens(campaign, timezone) {
-  const start = campaign.work_start_hour ?? 0;
-  const nowHour = parseInt(
-    new Intl.DateTimeFormat('en-US', { hour: 'numeric', hour12: false, timeZone: timezone }).format(new Date()),
-    10
-  );
-  const nowMin = new Date().getMinutes();
-  if (nowHour < start) return (start - nowHour) * 60 - nowMin;
-  return (24 - nowHour + start) * 60 - nowMin;
+  if (wh.start < wh.end) return nowHour >= wh.start && nowHour < wh.end;
+  return nowHour >= wh.start || nowHour < wh.end;
 }
 
 async function sendHeartbeat(force = false) {
@@ -530,11 +727,23 @@ async function sendHeartbeat(force = false) {
     }
 
     const newExpiresAt = Date.now() + 600_000; // 10-minute lease
-    await supabaseReq(`browser_instances?id=eq.${state.browserId}`, "PATCH", {
+    const manifest = chrome.runtime.getManifest();
+    const heartbeatPayload = {
       last_heartbeat_at: new Date().toISOString(),
       expires_at: new Date(newExpiresAt).toISOString(),
-      status: 'active'
-    });
+      status: 'active',
+      extension_version: manifest.version,
+      last_seen_at: new Date().toISOString(),
+    };
+    // Add platform/user_agent once (on force=true, i.e. first heartbeat)
+    if (force) {
+      try {
+        const platformInfo = await chrome.runtime.getPlatformInfo();
+        heartbeatPayload.platform = platformInfo.os || 'unknown';
+      } catch {}
+      heartbeatPayload.user_agent = navigator.userAgent || '';
+    }
+    await supabaseReq(`browser_instances?id=eq.${state.browserId}`, "PATCH", heartbeatPayload);
     await chrome.storage.local.set({ leaseExpiresAt: newExpiresAt });
     debugLog(`Heartbeat sent! Lease renewed for 10 min.`);
   } catch (err) {
@@ -544,44 +753,14 @@ async function sendHeartbeat(force = false) {
 }
 
 // ---------------------------------------------------------------------------
-// Pacing Engine Helpers
+// Pacing Engine Helpers (centralized — server schedules, extension clamps)
 // ---------------------------------------------------------------------------
-
-async function checkDailyLimit() {
-  const data = await chrome.storage.local.get(['pacingSettings', 'dailyStats']);
-  const settings = data.pacingSettings || { dailyLimit: 30, baseDelay: 90, minVariance: 5, maxVariance: 300 };
-  
-  let stats = data.dailyStats || { date: new Date().toDateString(), sent: 0 };
-  
-  if (stats.date !== new Date().toDateString()) {
-    stats = { date: new Date().toDateString(), sent: 0 };
-    await chrome.storage.local.set({ dailyStats: stats });
-  }
-  
-  return {
-    isLimited: stats.sent >= settings.dailyLimit,
-    sent: stats.sent,
-    limit: settings.dailyLimit,
-    settings: settings
-  };
-}
-
-async function incrementDailyLimit() {
-  const data = await chrome.storage.local.get(['dailyStats']);
-  let stats = data.dailyStats || { date: new Date().toDateString(), sent: 0 };
-  stats.sent += 1;
-  await chrome.storage.local.set({ dailyStats: stats });
-}
-
-function randomInt(min, max) {
-  return Math.floor(Math.random() * (max - min + 1)) + min;
-}
 
 async function pollTasks() {
   if (!state.browserId) return;
   const pacingData = await chrome.storage.local.get('wakeUpAt');
   if (pacingData.wakeUpAt && Date.now() < pacingData.wakeUpAt) {
-    return; // Still sleeping for human pacing
+    return; // Still sleeping until next scheduled task
   }
 
   if (state.isProcessing) {
@@ -605,51 +784,67 @@ async function pollTasks() {
       return;
     }
 
-    const limitCheck = await checkDailyLimit();
-    if (limitCheck.isLimited) {
-      debugLog(`[Pacing] Daily limit reached (${limitCheck.sent}/${limitCheck.limit}).`);
+    // Working hours safety clamp (not a scheduling brain — server schedules)
+    // Prevents past-due tasks from firing outside working hours.
+    const wh = await getUserWorkingHours();
+    if (!isWithinWorkingHours(wh)) {
+      // Sleep until working hours start
+      const nowHour = parseInt(
+        new Intl.DateTimeFormat('en-US', { hour: 'numeric', hour12: false, timeZone: wh.timezone }).format(new Date()),
+        10
+      );
+      const nowMin = new Date().getMinutes();
+      let minsUntilOpen;
+      if (nowHour < wh.start) minsUntilOpen = (wh.start - nowHour) * 60 - nowMin;
+      else minsUntilOpen = (24 - nowHour + wh.start) * 60 - nowMin;
+      const wakeMs = Date.now() + Math.max(minsUntilOpen, 1) * 60 * 1000;
+      await chrome.storage.local.set({ wakeUpAt: wakeMs });
+      debugLog(`[Poll] Outside working hours (${nowHour}h, window ${wh.start}-${wh.end}). Sleeping ${minsUntilOpen}m.`);
       return;
     }
 
-    // Working hours gate — skip polling entirely if all campaigns are outside window
-    const campaignSettingsResult = await getActiveCampaignSettings();
-    const whTimezone = campaignSettingsResult.timezone;
-    const whCampaigns = campaignSettingsResult.data.filter(c => c.working_hours_enabled);
-    if (whCampaigns.length > 0) {
-      const anyOpen = whCampaigns.some(c => isInWorkingHours(c, whTimezone));
-      if (!anyOpen) {
-        const minWait = Math.min(...whCampaigns.map(c => minsUntilWindowOpens(c, whTimezone)));
-        const wakeMs = Date.now() + Math.max(minWait, 1) * 60 * 1000;
-        await chrome.storage.local.set({ wakeUpAt: wakeMs });
-        debugLog(`[Poll] All campaigns outside working hours. Sleeping ${minWait}m.`);
-        return;
-      }
-    }
-
-    // 1. Fetch a pending task
-    const url = `dm_tasks?select=*,campaigns!inner(status,working_hours_enabled,work_start_hour,work_end_hour)&browser_instance_id=eq.${state.browserId}&status=eq.pending&campaigns.status=eq.active&order=created_at.asc&limit=1`;
+    // 1. Fetch a pending task that is due now (scheduled_at <= now OR scheduled_at IS NULL)
+    // NULL scheduled_at = old task generated before centralized pacing = "due now"
+    const nowIso = new Date().toISOString();
+    const url = `dm_tasks?select=*,campaigns!inner(status)&browser_instance_id=eq.${state.browserId}&status=eq.pending&campaigns.status=eq.active&or=(scheduled_at.is.null,scheduled_at.lte.${nowIso})&order=scheduled_at.asc.nullslast,created_at.asc&limit=1`;
     const tasks = await supabaseReq(url);
 
     if (!tasks || tasks.length === 0) {
-      const BACKOFF_MS = [15000, 30000, 60000, 120000, 300000];
-      const backoffMs = BACKOFF_MS[Math.min(state.emptyPollCount, BACKOFF_MS.length - 1)];
-      state.emptyPollCount++;
-      await chrome.storage.local.set({ wakeUpAt: Date.now() + backoffMs });
-      debugLog(`[Poll] 0 tasks. Backing off ${backoffMs / 1000}s (empty #${state.emptyPollCount}).`);
+      // Nothing due — find the next future scheduled_at so we sleep until then
+      // instead of blind backoff. One cheap query.
+      try {
+        const future = await supabaseReq(`dm_tasks?select=scheduled_at&browser_instance_id=eq.${state.browserId}&status=eq.pending&scheduled_at=not.is.null&order=scheduled_at.asc&limit=1`);
+        if (future && future.length > 0 && future[0].scheduled_at) {
+          const nextAt = new Date(future[0].scheduled_at).getTime();
+          const sleepMs = Math.max(nextAt - Date.now(), 5000); // min 5s safety
+          await chrome.storage.local.set({ wakeUpAt: Date.now() + sleepMs });
+          debugLog(`[Poll] 0 due tasks. Next at ${future[0].scheduled_at}. Sleeping ${Math.round(sleepMs/1000)}s.`);
+        } else {
+          // No future tasks at all — back off
+          const BACKOFF_MS = [30000, 60000, 120000, 300000];
+          const backoffMs = BACKOFF_MS[Math.min(state.emptyPollCount, BACKOFF_MS.length - 1)];
+          state.emptyPollCount++;
+          await chrome.storage.local.set({ wakeUpAt: Date.now() + backoffMs });
+          debugLog(`[Poll] 0 tasks at all. Backing off ${backoffMs / 1000}s.`);
+        }
+      } catch {
+        state.emptyPollCount++;
+      }
       return;
     }
 
     const task = tasks[0];
-    state.emptyPollCount = 0; // queue has work — reset backoff to 15s
-
-    // Per-task working hours check — skip if this task's campaign is outside its window
-    if (task.campaigns?.working_hours_enabled) {
-      if (!isInWorkingHours(task.campaigns, whTimezone)) {
-        debugLog(`[Poll] Task ${task.id} skipped — campaign outside working hours.`);
-        return;
-      }
-    }
+    state.emptyPollCount = 0;
     delete task.campaigns;
+
+    // 3-minute hard floor — even if the server stamps 20 tasks at the same
+    // second, the extension clamps to max 1 send per 3 minutes.
+    if (state.lastTaskCompletedAt && Date.now() - state.lastTaskCompletedAt < 180000) {
+      const waitMs = 180000 - (Date.now() - state.lastTaskCompletedAt);
+      await chrome.storage.local.set({ wakeUpAt: Date.now() + waitMs });
+      debugLog(`[Floor] 3-min hard floor — waiting ${Math.round(waitMs/1000)}s before next send.`);
+      return;
+    }
 
     if (task.contact_id) {
       const contacts = await supabaseReq(`contacts?select=username,full_name&id=eq.${task.contact_id}`);
@@ -658,7 +853,7 @@ async function pollTasks() {
       }
     }
 
-    await supabaseReq(`dm_tasks?id=eq.${task.id}`, "PATCH", { status: "processing" });
+    await supabaseReq(`dm_tasks?id=eq.${task.id}`, "PATCH", { status: "processing", claimed_at: new Date().toISOString() });
 
     debugLog(`Processing task: ${task.task_type}`);
 
@@ -669,13 +864,21 @@ async function pollTasks() {
       if (result?.isLimited) {
         debugLog("[Pacing] Rate limit detected from content script! Pausing engine to prevent ban.");
         await chrome.storage.local.set({ enginePaused: true });
+        // Auto-resume after cooldown_after_error minutes (read from user_settings)
+        const whSettings = await getUserWorkingHours();
+        // cooldown is not in the cached wh object — fetch separately if needed
+        // For now, default to 30 min auto-resume
+        setTimeout(() => {
+          chrome.storage.local.get('enginePaused', async (data) => {
+            if (data.enginePaused) {
+              await chrome.storage.local.remove('enginePaused');
+              debugLog("[Pacing] Auto-resuming after rate-limit cooldown.");
+            }
+          });
+        }, 30 * 60 * 1000);
       }
 
       if (result?.skippedReply) {
-        // Reply-skip: the lead already replied, so nothing was sent. Record it
-        // honestly — task = skipped (NOT completed), do NOT advance the follow-up
-        // chain, do NOT charge quota, do NOT pacing-sleep. `replied` was already
-        // persisted (global + per-account) inside executeTask.
         await supabaseReq(`dm_tasks?id=eq.${task.id}`, "PATCH", {
           status: "skipped",
           error_reason: "lead_replied"
@@ -694,7 +897,6 @@ async function pollTasks() {
             dmed_at: new Date().toISOString(),
             assigned_browser_id: state.browserId
           });
-          // Dual-write per-account outreach (Phase 1)
           await caoUpsert(task.contact_id, {
             status: "dmed",
             dmed_at: new Date().toISOString(),
@@ -707,7 +909,6 @@ async function pollTasks() {
             current_follow_up: `1${stepLetter}`,
             last_follow_up_at: new Date().toISOString()
           });
-          // Dual-write per-account outreach (Phase 1)
           await caoUpsert(task.contact_id, {
             followup_1a_sent: true,
             current_follow_up: `1${stepLetter}`,
@@ -724,7 +925,6 @@ async function pollTasks() {
       console.error("Task failed:", err);
       const isThreadBusy = err.message?.includes("thread is busy");
       if (isThreadBusy) {
-        // Re-queue as pending without increasing retry count (thread was busy with hooks)
         await supabaseReq(`dm_tasks?id=eq.${task.id}`, "PATCH", { status: "pending" });
         debugLog(`[Recovery] Task ${task.task_type} re-queued as pending (thread was busy)`);
       } else {
@@ -748,11 +948,9 @@ async function pollTasks() {
             error_reason: `[Attempt ${nextRetry}/3] ${err.message || String(err)}`
           });
 
-          // Short 30s backoff delay before retrying transient failures
           const wakeUpAt = Date.now() + 30000;
           await chrome.storage.local.set({ wakeUpAt });
         } else {
-          // Permanent error OR max retries reached -> mark as failed
           await supabaseReq(`dm_tasks?id=eq.${task.id}`, "PATCH", {
             status: "failed",
             error_reason: currentRetries >= 3 
@@ -779,18 +977,9 @@ async function pollTasks() {
     await chrome.storage.local.set({ stats: state.stats });
     chrome.runtime.sendMessage({ type: "STATS_UPDATE", stats: state.stats }).catch(()=>null);
 
-    // Only apply pacing delay and daily limit increment on actual success
-    if (taskSucceeded && (task.task_type === 'first_dm' || task.task_type.startsWith('followup_'))) {
-      await incrementDailyLimit();
-
-      const extra = randomInt(limitCheck.settings.minVariance, limitCheck.settings.maxVariance);
-      const delayMs = Math.max(0, limitCheck.settings.baseDelay + extra) * 1000;
-
-      debugLog(`[Pacing] Sleeping for ${Math.round(delayMs/1000)}s...`);
-
-      const wakeUpAt = Date.now() + delayMs;
-      await chrome.storage.local.set({ wakeUpAt });
-    }
+    // No local pacing sleep — the server's scheduled_at on the next task
+    // determines when we wake. The poll query + wakeUpAt logic above
+    // handles this automatically.
 
   } catch (err) {
     console.error("Polling error:", err);
@@ -1468,13 +1657,24 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return;
   }
   if (message.type === "HUB_SESSION_SYNCED") {
+    // Track that the web app is open (used to defer extension's own token refresh
+    // and avoid rotation collisions that kill the token family).
+    state.lastSessionSync = Date.now();
+
+    // Clear session-expired flag if present — the web app has a fresh session
+    chrome.storage.local.remove('sessionExpired').catch(()=>null);
+
     // Check if we already have the same token to avoid unnecessary restarts
     if (state.accessToken !== message.payload.accessToken) {
       state.accessToken = message.payload.accessToken;
       state.refreshToken = message.payload.refreshToken;
-      chrome.storage.local.set({ accessToken: state.accessToken, refreshToken: state.refreshToken }).then(() => {
+      chrome.storage.local.set({ accessToken: state.accessToken, refreshToken: state.refreshToken }).then(async () => {
         chrome.runtime.sendMessage({ type: "HUB_LOGIN_SUCCESS" }).catch(()=>null);
         debugLog("Auto-Login Sync Successful!");
+        // Auto-pair: if not already paired, create or adopt a browser row
+        if (!state.browserId) {
+          await autoPairBrowser();
+        }
       }).catch(err => debugLog(`Auto-Login Sync storage error: ${err.message}`));
     }
     sendResponse({ ok: true });
@@ -1569,6 +1769,68 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           await processCollectedMessages(taskData?.readReceipts || []);
           sendResponse({ success: true, result: true });
         } catch (err) {
+          sendResponse({ success: false, error: err.message });
+        }
+      })();
+      return true;
+    }
+
+    // registerAccounts: content script reports the logged-in IG account(s).
+    // The content script already sends this on every init — the old background
+    // dropped it into the default passthrough. Now we use it to auto-detect
+    // the IG username and write it to browser_instances.
+    if (taskType === "registerAccounts") {
+      (async () => {
+        try {
+          const accounts = taskData?.accounts || [];
+          const currentId = taskData?.current_id;
+          const currentAccount = accounts.find((a) => a.instagram_id === currentId) || accounts[0];
+
+          if (currentAccount && currentAccount.username && state.browserId) {
+            const igUsername = currentAccount.username.toLowerCase().replace(/^@/, "");
+            const igUserId = currentAccount.instagram_id || null;
+
+            // Check what's currently stored
+            const existing = await supabaseReq(`browser_instances?select=id,ig_username,user_id,instance_key&eq.id.${state.browserId}`);
+
+            if (existing && existing.length > 0) {
+              const row = existing[0];
+              const storedUsername = row.ig_username ? row.ig_username.toLowerCase().replace(/^@/, "") : null;
+
+              // Only update a row that actually belongs to THIS browser. The row's
+              // instance_key is the physical browser's identity — if it differs from
+              // ours, this is a DIFFERENT browser, and we must never clobber its
+              // IG pairing with the account detected from this tab.
+              const myKey = await ensureInstanceKey();
+              if (row.instance_key && myKey && row.instance_key !== myKey) {
+                debugLog(`[IG Detect] Skipping update — row ${row.id} belongs to a different browser instance (key ${row.instance_key}), not ours (${myKey}).`);
+                sendResponse({ success: true, result: [] });
+                return;
+              }
+
+              if (storedUsername !== igUsername) {
+                if (storedUsername) {
+                  debugLog(`[IG Detect] MISMATCH: paired as @${storedUsername} but logged in as @${igUsername}. Updating.`);
+                } else {
+                  debugLog(`[IG Detect] Detected logged-in IG account: @${igUsername}`);
+                }
+
+                // Update the browser row with the detected IG username
+                await supabaseReq(`browser_instances?id=eq.${state.browserId}`, "PATCH", {
+                  ig_username: igUsername,
+                  ig_user_id: igUserId,
+                });
+
+                // Update the label to show the @handle
+                state.browserLabel = `@${igUsername}`;
+                await chrome.storage.local.set({ browserLabel: state.browserLabel });
+              }
+            }
+          }
+
+          sendResponse({ success: true, result: [] });
+        } catch (err) {
+          debugLog(`[IG Detect] Error: ${err.message}`);
           sendResponse({ success: false, error: err.message });
         }
       })();
