@@ -1181,10 +1181,21 @@
         );
       }
       async _alternativeSearchResultsMapping({ username: t }) {
-        const r = await this._importDefault("bs_caml_int64");
-        return (await this._getDatabase("server_search_results"))
-          .map((e) => this._formatData({ data: e, bs_caml_int64: r }))
-          .find((e) => e.contextLine === t);
+        // Fail soft: server_search_results is an IG in-memory ReStore table that
+        // may not exist (no search populated it, IG relocated it, or hooks didn't
+        // inject cleanly). _getDatabase -> _findReStoreTable THROWS when missing;
+        // an unhandled throw here used to kill the whole task before the search
+        // dialog was closed, stacking search boxes across retries. Returning null
+        // instead lets the primary fiber read (findSearchResult) win. Mirrors the
+        // existing catch in _getUserFromContacts.
+        try {
+          const r = await this._importDefault("bs_caml_int64");
+          return (await this._getDatabase("server_search_results"))
+            .map((e) => this._formatData({ data: e, bs_caml_int64: r }))
+            .find((e) => e.contextLine === t);
+        } catch (e) {
+          return (console.warn("[ColdDMs] _alternativeSearchResultsMapping: ReStore unavailable, returning null", e), null);
+        }
       }
       async _clickOnUser({ threadId: t, userId: r }) {
         try {

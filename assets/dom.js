@@ -380,22 +380,30 @@ class ADBlockDOM {
     username: s
   }) {
     var r = await this.domReactConnector.send("findSearchResult", {});
+    this.log({ type: "[searchWindow] findSearchResult (live fibers) returned", data: { username: s, resultCount: r?.length ?? 0 } });
     if (r?.length) {
       let e = r.filter(e => "user" === e.type).find(({
         candidate: e
       }) => s ? e.subtext === s : e.igid === t);
+      if (e) this.log({ type: "[searchWindow] Matched via live fibers (primary path)", data: { username: s, threadId: e?.candidate?.id ?? null } });
       if (!e && s) {
+        this.log({ type: "[searchWindow] No fiber match — trying server_search_results fallback (fail-soft)", data: { username: s } });
         const n = await this.domReactConnector.send("alternativeSearchResultsMapping", {
           username: s
         });
         n && (e = r.filter(e => "user" === e.type).find(({
           candidate: e
-        }) => String(e.igid) === String(n.resultIgid)))
+        }) => String(e.igid) === String(n.resultIgid)));
+        if (e) this.log({ type: "[searchWindow] Matched via server_search_results fallback", data: { username: s, threadId: e?.candidate?.id ?? null } });
       }
       if (!e) {
         const singleMatch = r.filter(x => "user" === x.type);
-        if (singleMatch.length === 1) e = singleMatch[0];
+        if (singleMatch.length === 1) {
+          e = singleMatch[0];
+          this.log({ type: "[searchWindow] Matched via single-result heuristic", data: { username: s, threadId: e?.candidate?.id ?? null } });
+        }
       }
+      if (!e) this.log({ type: "[searchWindow] No match found in this pass", data: { username: s } });
       return e
     }
   }
@@ -476,45 +484,67 @@ class ADBlockDOM {
   async _findUserInDialogWithoutClick({
     username: e
   }) {
-    if (!await this.domReactConnector.send("clickDialogButton", {})) throw new ExtensionError({
-      type: "open_search_popup_error",
-      message: "Error while opening the popup"
-    });
-    if (await this.sleep(5e3), !await this.domReactConnector.send("enterUsername", {
+    try {
+      this.log({ type: "[findUserInDialog] Opening search dialog", data: { username: e } });
+      if (!await this.domReactConnector.send("clickDialogButton", {})) throw new ExtensionError({
+        type: "open_search_popup_error",
+        message: "Error while opening the popup"
+      });
+      this.log({ type: "[findUserInDialog] Dialog opened, typing username", data: { username: e } });
+      if (await this.sleep(5e3), !await this.domReactConnector.send("enterUsername", {
+          username: e
+        })) throw new ExtensionError({
+        type: "user_search_error",
+        message: "Error while entering username"
+      });
+      await this.sleep(5e3);
+      this.log({ type: "[findUserInDialog] Reading search results (attempt 1)", data: { username: e } });
+      var t = await this._clickOnUserIdAndGetDialogButton({
         username: e
-      })) throw new ExtensionError({
-      type: "user_search_error",
-      message: "Error while entering username"
-    });
-    await this.sleep(5e3);
-    var t = await this._clickOnUserIdAndGetDialogButton({
-      username: e
-    });
-    if (t) return await this.domReactConnector.send("closeOpenDialogModal", {}), t;
-    if (this.log({
-        type: "User was not found in dialog in first attempt",
-        data: {}
-      }), !await this.domReactConnector.send("enterUsername", {
-        username: "instagra"
-      })) throw new ExtensionError({
-      type: "user_search_error",
-      message: "Error while entering username"
-    });
-    if (await this.sleep(2e3), !await this.domReactConnector.send("enterUsername", {
+      });
+      if (t) {
+        this.log({ type: "[findUserInDialog] Match found (attempt 1)", data: { username: e, threadId: t?.candidate?.id ?? null } });
+        return t;
+      }
+      if (this.log({
+          type: "User was not found in dialog in first attempt",
+          data: {}
+        }), !await this.domReactConnector.send("enterUsername", {
+          username: "instagra"
+        })) throw new ExtensionError({
+        type: "user_search_error",
+        message: "Error while entering username"
+      });
+      if (await this.sleep(2e3), !await this.domReactConnector.send("enterUsername", {
+          username: e
+        })) throw new ExtensionError({
+        type: "user_search_error",
+        message: "Error while entering username"
+      });
+      await this.sleep(5e3);
+      this.log({ type: "[findUserInDialog] Reading search results (attempt 2)", data: { username: e } });
+      t = await this._clickOnUserIdAndGetDialogButton({
         username: e
-      })) throw new ExtensionError({
-      type: "user_search_error",
-      message: "Error while entering username"
-    });
-    await this.sleep(5e3);
-    t = await this._clickOnUserIdAndGetDialogButton({
-      username: e
-    });
-    if (t) return await this.domReactConnector.send("closeOpenDialogModal", {}), t;
-    throw new ExtensionError({
-      type: "user_click_error",
-      message: "User was not found in popup"
-    })
+      });
+      if (t) {
+        this.log({ type: "[findUserInDialog] Match found (attempt 2)", data: { username: e, threadId: t?.candidate?.id ?? null } });
+        return t;
+      }
+      this.log({ type: "[findUserInDialog] User not found after 2 attempts — throwing", data: { username: e } });
+      throw new ExtensionError({
+        type: "user_click_error",
+        message: "User was not found in popup"
+      })
+    } finally {
+      // Always close the search dialog, on success OR throw, so a failed
+      // follow-up can never leave a box open and stack another on the next retry.
+      try {
+        await this.domReactConnector.send("closeOpenDialogModal", {});
+        this.log({ type: "[findUserInDialog] Search dialog closed (finally)", data: { username: e } });
+      } catch (_e) {
+        this.log({ type: "[findUserInDialog] closeOpenDialogModal failed (non-fatal)", data: { username: e, error: _e?.toString?.() } });
+      }
+    }
   }
   _enterSymbol({
     symbol: a

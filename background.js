@@ -1199,28 +1199,30 @@ async function executeTask(task) {
     const targetUsername = task.contacts?.username;
     if (!targetUsername) throw new Error("Missing target username in contact relation");
 
-    // Follow-ups route through the MAIN tab's normal sendMessage path — exactly
-    // like first_dm — which already handles init-wait, switch-account, openUser
-    // retry and thread-open verification. This mirrors ColdDMs, where every send
-    // (including follow-ups) runs on the main tab and the additional tab is used
-    // only as a fallback via the sendMessageAdditionalTab emit.
+    // Follow-ups use the ColdDMs thread-open path. The main tab opens DMs, then
+    // (because isOpenNewTab is set) calls findUserInDialogWithoutClick to scrape
+    // the LIVE candidate.id off Instagram's freshly rendered search results,
+    // always closes the search dialog, and hands off via sendMessageAdditionalTab.
+    // The additional tab then opens https://www.instagram.com/direct/t/<live id>/
+    // directly (thread already on screen, no search box) and sends there.
     //
-    // We route by USERNAME, not the stored thread_id: the stored thread_id is a
-    // URL numeric id captured in a previous session; Instagram's open-check
-    // (_checkIfOpenUserRequired) compares it against the live React store's
-    // thread_key, and the two schemes don't always match — causing a false
-    // "Dialog is not opened" failure even with the thread open. ColdDMs never
-    // persists thread_id; it re-derives the thread live. thread_id /
-    // assigned_thread_id remain stored for observability only.
+    // We deliberately use the FRESH live id, never the stored thread_id: the
+    // stored thread_id is a URL numeric id captured in a previous session, and
+    // Instagram's open-check (_checkIfOpenUserRequired) compares it against the
+    // live React store's thread_key — the two schemes don't always match, which
+    // caused the old false "Dialog is not opened" failures. ColdDMs re-derives a
+    // fresh id at send time; so do we. thread_id / assigned_thread_id remain
+    // stored for observability only. targetUrl stays null so the MAIN tab does
+    // not navigate — only the additional tab opens the live thread URL.
     const targetUrl = null;
-    debugLog(`[Followup] Routing via main-tab sendMessage (live thread resolution) for ${targetUsername}`);
+    debugLog(`[Followup] Routing via main-tab live-id scrape -> additional-tab thread open for ${targetUsername}`);
 
     const payload = {
       target: { username: targetUsername },
       message: { text: task.message_text },
       taskId: task.id,
       skipMessageExistsCheck: false,
-      isOpenNewTab: false
+      isOpenNewTab: true
     };
 
     return new Promise((resolve, reject) => {
@@ -1745,7 +1747,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         try {
           const threadId = taskData?.threadId;
           const threadUrl = threadId ? `https://www.instagram.com/direct/t/${threadId}/` : null;
-          debugLog(`[Fallback] Opening additional tab for thread ${threadUrl || "(no thread id)"}`);
+          const targetU = taskData?.target?.username ?? "(unknown)";
+          debugLog(`[Followup->AddlTab] Handoff received for @${targetU} | taskId=${taskData?.taskId} | live threadId=${threadId || "(none)"} | url=${threadUrl || "(no url — will open by username)"}`);
+          if (!threadId) {
+            debugLog(`[Followup->AddlTab] WARNING: no live threadId in handoff for @${targetU} — additional tab will land on inbox and must self-recover by username.`);
+          }
           await sendTaskToContent("additional", "sendMessageFromDialog", {
             target: taskData?.target,
             message: taskData?.message,
@@ -1753,9 +1759,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             isTakeSnapshot: taskData?.isTakeSnapshot,
             skipMessageExistsCheck: taskData?.skipMessageExistsCheck
           }, threadUrl);
+          debugLog(`[Followup->AddlTab] sendMessageFromDialog dispatched to additional tab for @${targetU} | taskId=${taskData?.taskId}`);
           sendResponse({ success: true });
         } catch (err) {
-          debugLog(`[Fallback] Additional-tab send failed: ${err.message}`);
+          debugLog(`[Followup->AddlTab] Additional-tab send failed for taskId=${taskData?.taskId}: ${err.message}`);
           sendResponse({ success: false, error: err.message });
         }
       })();

@@ -677,16 +677,23 @@ class Instagram {
               }), await this.sleep(5e3), await this._checkIfOpenUserRequired({
                 username: e.username
               })) {
-              if (n) return h = await this.domConnector.send("findUserInDialogWithoutClick", {
-                username: e.username
-              }), this.backgroundConnector.emit("sendMessageAdditionalTab", {
-                target: e,
-                message: t,
-                taskId: s,
-                isTakeSnapshot: i,
-                threadId: h.candidate.id,
-                skipMessageExistsCheck: o
-              }), !0;
+              if (n) {
+                this.log({ type: "[Followup] isOpenNewTab set — scraping LIVE thread id from search dialog", data: { username: e.username, taskId: s } });
+                h = await this.domConnector.send("findUserInDialogWithoutClick", {
+                  username: e.username
+                });
+                this.log({ type: "[Followup] Live thread id scraped from search results", data: { username: e.username, taskId: s, threadId: h?.candidate?.id ?? null, matched: !!h?.candidate } });
+                this.backgroundConnector.emit("sendMessageAdditionalTab", {
+                  target: e,
+                  message: t,
+                  taskId: s,
+                  isTakeSnapshot: i,
+                  threadId: h.candidate.id,
+                  skipMessageExistsCheck: o
+                });
+                this.log({ type: "[Followup] Handoff emitted -> additional tab will open /direct/t/<id>/ and send", data: { taskId: s, threadId: h?.candidate?.id ?? null } });
+                return !0;
+              }
               await this.domConnector.send("openUser", {
                 username: e.username
               }), this.log({
