@@ -888,7 +888,9 @@
           this.innerDomConnector.registerTask("getUser", () => this._getUser()),
           this.innerDomConnector.registerTask("preTaskHooks", () => this._preTaskHooks()),
           this.innerDomConnector.registerTask("getAllMessages", () => this._getAllMessages()),
-          this.innerDomConnector.registerTask("checkResponseFromDOM", () => this._checkResponseFromDOM()),
+          this.innerDomConnector.registerTask("checkResponseFromDOM", ({ sinceMs: e } = {}) =>
+            this._checkResponseFromDOM({ sinceMs: e }),
+          ),
           this.innerDomConnector.registerTask("checkOutgoingMessageSentFromDOM", ({ text: e, dateBeforeSend: t }) =>
             this._checkOutgoingMessageSentFromDOM({ text: e, dateBeforeSend: t }),
           ),
@@ -1785,18 +1787,30 @@
         }
         return e;
       }
-      _checkResponseFromDOM() {
+      _checkResponseFromDOM({ sinceMs: _sinceMs = null } = {}) {
         var e = this._getAllMessagesFromDOM();
+        // Anchor = the newest OUTGOING message. A reply only counts if it is
+        // newer than this anchor. When sinceMs is provided (the ts of the send
+        // we're guarding), use whichever is more recent so a stale inbound
+        // message from before our send can't be misread as a fresh reply.
         const t = e
           .filter((e) => !0 === e.outgoing && e.timestamp_ms)
           .sort((e, t) => Number(t.timestamp_ms) - Number(e.timestamp_ms))[0];
-        return t &&
+        const _anchorMs = Math.max(
+          t ? Number(t.timestamp_ms) : 0,
+          _sinceMs != null ? Number(_sinceMs) : 0,
+        );
+        // Require an anchor: either an outgoing message exists, or sinceMs was
+        // supplied. Without one we can't distinguish a fresh reply from history.
+        if (!t && _sinceMs == null) return null;
+        return (
           (e = e
             .filter((e) => !1 === e.outgoing && e.text && e.timestamp_ms)
             .sort((e, t) => Number(t.timestamp_ms) - Number(e.timestamp_ms))
-            .find((e) => Number(e.timestamp_ms) > Number(t.timestamp_ms)))
-          ? { text: e.text }
-          : null;
+            .find((e) => Number(e.timestamp_ms) > _anchorMs))
+            ? { text: e.text }
+            : null
+        );
       }
       _checkOutgoingMessageSentFromDOM({ dateBeforeSend: t }) {
         return this._getAllMessagesFromDOM().some(

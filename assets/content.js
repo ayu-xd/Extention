@@ -720,7 +720,13 @@ class Instagram {
               }
             });
             if (!g || ["0", "3"].includes(g.contact_reachability_status_type)) {
-              if (!o && !SETTINGS.IGNORE_MESSAGE_EXISTS && g?.messages?.length) {
+              // Reply guard (main tab). The `g?.messages?.length` precondition was
+              // removed (matches ColdDMs 27-Jul): on a freshly-opened tab the ReStore
+              // query layer often hasn't hydrated yet, so `g.messages` is empty and the
+              // check used to be skipped entirely — firing a follow-up at someone who
+              // already replied. checkResponseByReactAPI now falls back to the live DOM
+              // rows when the store is empty, so the check must always run here.
+              if (!o && !SETTINGS.IGNORE_MESSAGE_EXISTS) {
                 var m = await this.checkResponseByReactAPI(e);
                 if (Boolean(m)) {
                   this.log({
@@ -964,7 +970,10 @@ class Instagram {
               }
             });
             if (!o || ["0", "3"].includes(o.contact_reachability_status_type)) {
-              if (!r && !SETTINGS.IGNORE_MESSAGE_EXISTS && o?.messages?.length) {
+              // Reply guard (dialog / additional-tab fallback). Same fix as the main
+              // tab: dropped the `o?.messages?.length` precondition so the reply check
+              // runs even when the ReStore hasn't hydrated the thread yet on this tab.
+              if (!r && !SETTINGS.IGNORE_MESSAGE_EXISTS) {
                 var d, h = await this.checkResponseByReactAPI(e);
                 if (Boolean(h)) return this.log({
                   type: "Message from user exists, skipping send message",
@@ -1131,10 +1140,22 @@ class Instagram {
     }
   }
   async checkResponseByReactAPI({
-    username: t
+    username: t,
+    sinceMs: _sinceMs = null
   }) {
     var e = (await this.domConnector.send("getAllMessages", {}))[t];
-    return e ? e.messages.find(e => e.username === t) || null : this.domConnector.send("checkResponseFromDOM", {})
+    // No thread in the ReStore (common on a freshly-opened tab that hasn't
+    // hydrated yet) → fall back to reading the live message rows from the DOM.
+    // Propagate sinceMs so the fallback can ignore anything older than it.
+    if (!e) return this.domConnector.send("checkResponseFromDOM", { sinceMs: _sinceMs });
+    // ReStore has the thread: an inbound message is one whose `username` equals
+    // the target (outbound carries our own account username). When sinceMs is
+    // supplied, only count replies newer than it so a stale inbound message
+    // from before our last send can't be mistaken for a fresh reply.
+    var _candidates = e.messages.filter(e => e.username === t);
+    if (_sinceMs != null) _candidates = _candidates.filter(e => Number(e.timestampMs) > Number(_sinceMs));
+    // messages are pre-sorted newest-first, so [0] is the most recent reply.
+    return _candidates[0] || null;
   }
   async openDirect(e) {
     await this._findSearchButton(), await this.sleep(2e3), await this.domConnector.send("inputSearch", {

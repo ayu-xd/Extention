@@ -204,7 +204,11 @@ class ADBlockDOM {
       username: e
     }) => this._getUserThread({
       username: e
-    })), this.domConnector.registerTask("getDebugMessages", () => this._getDebugMessages()), this.domConnector.registerTask("getConsoleLogs", () => this._getConsoleLogs()), this.domConnector.registerTask("detectInstagramError", () => this._detectInstagramError()), this.domConnector.registerTask("checkResponseFromDOM", () => this._checkResponseFromDOM()), this.domConnector.registerTask("checkOutgoingMessageSentFromDOM", ({
+    })), this.domConnector.registerTask("getDebugMessages", () => this._getDebugMessages()), this.domConnector.registerTask("getConsoleLogs", () => this._getConsoleLogs()), this.domConnector.registerTask("detectInstagramError", () => this._detectInstagramError()), this.domConnector.registerTask("checkResponseFromDOM", ({
+      sinceMs: e
+    } = {}) => this._checkResponseFromDOM({
+      sinceMs: e
+    })), this.domConnector.registerTask("checkOutgoingMessageSentFromDOM", ({
       dateBeforeSend: e
     }) => this._checkOutgoingMessageSentFromDOM({
       dateBeforeSend: e
@@ -927,8 +931,12 @@ class ADBlockDOM {
       username: e
     })
   }
-  async _checkResponseFromDOM() {
-    return this.domReactConnector.send("checkResponseFromDOM", {})
+  async _checkResponseFromDOM({
+    sinceMs: e = null
+  } = {}) {
+    return this.domReactConnector.send("checkResponseFromDOM", {
+      sinceMs: e
+    })
   }
   async _checkOutgoingMessageSentFromDOM({
     dateBeforeSend: e
