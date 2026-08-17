@@ -296,10 +296,73 @@ async function ensureInstanceKey() {
   return key;
 }
 
+// ---------------------------------------------------------------------------
+// Ownership: instanceKey is the SINGLE SOURCE OF TRUTH.
+// A browser owns exactly the row whose instance_key == its own instanceKey.
+// browserId is just a cache of that row's id and must never be trusted blindly.
+//
+// verifyOwnership() confirms the currently-stored browserId still points at a
+// row this browser actually owns. If the saved browserId is missing, points at
+// a deleted row, or points at a row stamped with a DIFFERENT key (the
+// split-brain / "zombie row" case from the logs), it drops the stale browserId
+// so callers can re-pair cleanly. Returns true only when browserId is confirmed
+// ours.
+// ---------------------------------------------------------------------------
+async function verifyOwnership() {
+  if (!state.browserId) return false;
+  try {
+    const myKey = await ensureInstanceKey();
+    const rows = await supabaseReq(
+      `browser_instances?select=id,instance_key,label&id=eq.${state.browserId}`
+    );
+    const row = rows && rows[0];
+
+    // Row was deleted from under us → stored browserId is stale.
+    if (!row) {
+      debugLog(`[Ownership] Stored browserId ${state.browserId} no longer exists — clearing.`);
+      state.browserId = null;
+      await chrome.storage.local.remove('browserId');
+      return false;
+    }
+
+    // Row exists but has no key yet → claim it by stamping our key on it.
+    if (!row.instance_key) {
+      await supabaseReq(`browser_instances?id=eq.${state.browserId}`, "PATCH", { instance_key: myKey });
+      debugLog(`[Ownership] Claimed un-keyed row ${state.browserId} with key ${myKey}.`);
+      return true;
+    }
+
+    // Row belongs to a DIFFERENT browser → this is the zombie/split-brain case.
+    // Drop our stale browserId so we stop heartbeating a row we don't own.
+    if (row.instance_key !== myKey) {
+      debugLog(`[Ownership] MISMATCH: row ${state.browserId} owned by ${row.instance_key}, not us (${myKey}). Dropping stale browserId.`);
+      state.browserId = null;
+      await chrome.storage.local.remove('browserId');
+      return false;
+    }
+
+    // Keys match → we genuinely own this row.
+    return true;
+  } catch (err) {
+    // On a transient network/DB error, do NOT clear browserId (avoid thrashing
+    // a working pairing over a blip). Treat as "unverified but keep as-is".
+    debugLog(`[Ownership] Verify skipped (transient error: ${err.message}).`);
+    return true;
+  }
+}
+
 async function autoPairBrowser() {
+  // Even if a browserId is already stored, confirm it still belongs to us before
+  // trusting it. verifyOwnership() clears a stale/mismatched browserId so the
+  // adopt-or-create logic below can re-pair. This is what reconciles the
+  // split-brain state instead of blindly skipping.
   if (state.browserId) {
-    debugLog("[AutoPair] Already paired — skipping.");
-    return;
+    const owned = await verifyOwnership();
+    if (owned) {
+      debugLog("[AutoPair] Already paired and ownership verified — skipping.");
+      return;
+    }
+    debugLog("[AutoPair] Stored browserId was not ours — re-pairing from instance key.");
   }
 
   const userId = getUserIdFromToken(state.accessToken);
@@ -451,7 +514,7 @@ async function handleConnect(browserId, browserLabel) {
     // key-consistent. If the row has no key yet, generate one and stamp it.
     const myKey = await ensureInstanceKey();
     try {
-      const rows = await supabaseReq(`browser_instances?select=id,instance_key&eq.id.${browserId}`);
+      const rows = await supabaseReq(`browser_instances?select=id,instance_key&id=eq.${browserId}`);
       const row = rows && rows[0];
       if (row && row.instance_key && row.instance_key !== myKey) {
         // The user explicitly chose this row — claim it as this browser.
@@ -723,6 +786,19 @@ async function sendHeartbeat(force = false) {
     // force=true bypasses the check — used on startup and new connections.
     if (!force && leaseExpiresAt > Date.now() + 120_000) {
       debugLog(`Heartbeat skipped — lease valid for ${Math.round((leaseExpiresAt - Date.now()) / 1000)}s`);
+      return;
+    }
+
+    // Ownership gate: never keep a row alive that we don't own. Without this,
+    // a split-brain browser (browserId pointing at another instance's row)
+    // would heartbeat that row "Online" forever — the zombie-row bug. We only
+    // pay this DB read when actually about to write (roughly every ~8-9 min),
+    // not on skipped heartbeats. verifyOwnership() clears a stale browserId and
+    // triggers a clean re-pair instead of stamping the wrong row.
+    const owned = await verifyOwnership();
+    if (!owned) {
+      debugLog("Heartbeat aborted — this browser no longer owns its row. Re-pairing.");
+      await autoPairBrowser();
       return;
     }
 
@@ -1798,7 +1874,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             const igUserId = currentAccount.instagram_id || null;
 
             // Check what's currently stored
-            const existing = await supabaseReq(`browser_instances?select=id,ig_username,user_id,instance_key&eq.id.${state.browserId}`);
+            const existing = await supabaseReq(`browser_instances?select=id,ig_username,user_id,instance_key&id=eq.${state.browserId}`);
 
             if (existing && existing.length > 0) {
               const row = existing[0];
@@ -1810,7 +1886,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
               // IG pairing with the account detected from this tab.
               const myKey = await ensureInstanceKey();
               if (row.instance_key && myKey && row.instance_key !== myKey) {
-                debugLog(`[IG Detect] Skipping update — row ${row.id} belongs to a different browser instance (key ${row.instance_key}), not ours (${myKey}).`);
+                debugLog(`[IG Detect] Skipping update — row ${row.id} belongs to a different browser instance (key ${row.instance_key}), not ours (${myKey}). Re-pairing.`);
+                // Split-brain: our browserId points at a row we don't own. Drop it
+                // and re-pair so future heartbeats/IG-detects target the right row.
+                state.browserId = null;
+                await chrome.storage.local.remove('browserId');
+                await autoPairBrowser();
                 sendResponse({ success: true, result: [] });
                 return;
               }
